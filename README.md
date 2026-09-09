@@ -149,4 +149,4 @@ checklist, and the on-call runbook.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+No license file yet — all rights reserved for now.

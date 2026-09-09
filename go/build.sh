@@ -27,7 +27,7 @@ pack() { # GOOS GOARCH
 	local pkgdir=$DIST/pkg-frza_${VERSION}_$1_$2
 	mkdir -p "$pkgdir"
 	mv "$DIST/$out" "$pkgdir/frza"
-	cp ../LICENSE "$pkgdir/"
+	[ -f ../LICENSE ] && cp ../LICENSE "$pkgdir/" || true
 	tar -C "$DIST" -czf "$DIST/frza_${VERSION}_$1_$2.tar.gz" "pkg-frza_${VERSION}_$1_$2"
 	rm -rf "$pkgdir"
 }

@@ -1645,6 +1645,7 @@ Operating rules:
 - Large files: never cat them whole. First map with search (error keywords), then read_file the regions around hits. Skill preprocess scripts are preferred for big logs.
 - Extract archives to /tmp/frza-<case>/ (list with tar -tf first; never extract into the user's working directory).
 - Destructive or system-changing commands will be shown to the user for confirmation; propose them when needed, but expect refusal and have a read-only fallback.
+- Missing dependencies: check before running (command -v, python3 -c "import x"). When something is missing, explain what is needed and propose the exact install command — but NEVER install silently; installs are system changes and go through user confirmation like everything else. If the user declines, continue with a workaround that uses what is available.
 - When done, report: root cause, evidence chain, and concrete fix steps.`
 
 // skillsSystemBlock renders layer 3 (the skill catalog).

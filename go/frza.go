@@ -1,0 +1,3935 @@
+// frza - a terminal-native agentic troubleshooting agent.
+//
+// The model investigates with tools (bash/read_file/search/write_file) in an
+// agent loop, follows reusable skill playbooks (SKILL.md directories with
+// companion scripts), and operates under a production-grade safety model —
+// read-only commands auto-run, changes ask first, destructive ops warn in red
+// and back up identifiable targets, and every operation is journaled with
+// /undo rollback. Plain multi-provider chat still works out of the box.
+//
+// Features:
+//   - Agent loop with function calling over the OpenAI Responses API
+//     (SSE streaming; verified against Volcengine Ark / kimi-k3)
+//   - Built-in tools: bash (60s timeout, truncated output), read_file
+//     (offset/limit, binary detection), search (regex, capped), write_file
+//     (backup-on-overwrite), use_skill (on-demand playbook loading)
+//   - Skills: directory playbooks (~/.frza/skills/, repo skills/), two-level
+//     loading — catalog in system prompt, full body via use_skill
+//   - Safety model: chain-aware command classifier (read-only whitelist /
+//     reversible / destructive / unknown), y/n/a confirmation, append-only
+//     operation journal with secret redaction, /undo + /journal
+//   - REPL: !cmd runs shell directly, !!cmd feeds output to the model;
+//     /agent /skills /reload-skills /undo /journal plus the frz chat commands
+//   - Chat heritage (from frz): four provider protocols (Anthropic / OpenAI /
+//     Gemini / OpenAI Responses — chat-only except Responses), terminal
+//     Markdown rendering with CJK-aware tables and ASCII box realignment,
+//     sessions in ~/.frza/sessions/*.json
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unicode"
+
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/formatters"
+	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/alecthomas/chroma/v2/styles"
+	"github.com/chzyer/readline"
+	"github.com/rivo/uniseg"
+	"golang.org/x/term"
+)
+
+// Version and author info. version/buildTime are injected at build time via
+// -ldflags -X (see build.sh); a plain `go build` shows the default dev value.
+var (
+	version   = "dev"
+	buildTime = ""
+	author    = "Frank Zhu <flankeroot@gmail.com>"
+)
+
+func shortVersion() string { return "frza " + version }
+
+// versionString is the full version line: version + build time + platform
+// (handy for checking the architecture of distributed binaries) + author.
+func versionString() string {
+	s := shortVersion()
+	if buildTime != "" {
+		s += " (" + buildTime + ")"
+	}
+	return fmt.Sprintf("%s %s/%s  by %s", s, runtime.GOOS, runtime.GOARCH, author)
+}
+
+var (
+	appDir     = filepath.Join(os.Getenv("HOME"), ".frza")
+	sessDir    = filepath.Join(appDir, "sessions")
+	exportDir  = filepath.Join(appDir, "exports")
+	configFile = filepath.Join(appDir, "config.json")
+)
+
+var defaultModels = map[string]string{
+	"anthropic":        "claude-sonnet-4-6",
+	"openai":           "gpt-4o",
+	"gemini":           "gemini-2.5-flash",
+	"openai_responses": "kimi-k3",
+}
+
+var envKeyNames = map[string]string{
+	"anthropic":        "ANTHROPIC_API_KEY",
+	"openai":           "OPENAI_API_KEY",
+	"gemini":           "GEMINI_API_KEY",
+	"openai_responses": "ARK_API_KEY",
+}
+
+// Default API base URLs per provider. anthropic/openai/gemini URLs are hardcoded
+// in their callers; the Responses protocol may front different vendors
+// (Volcengine Ark, or the official OpenAI Responses API in the future),
+// so it gets an overridable default here.
+var defaultBaseURLs = map[string]string{
+	"openai_responses": "https://ark.cn-beijing.volces.com/api/v3",
+}
+
+// Providers with true typewriter streaming (print as generated)
+var streamingProviders = map[string]bool{"openai_responses": true}
+
+// --------------------------------------------------------------------------
+// Basic utilities
+// --------------------------------------------------------------------------
+
+func ensureDirs() { os.MkdirAll(sessDir, 0o755) }
+
+// embeddedSkills ships the starter playbooks inside the binary so a bare
+// frza works out of the box; they are released to ~/.frza/skills on first
+// run (only when the user has no skills of their own yet).
+//
+//go:embed skills
+var embeddedSkills embed.FS
+
+func releaseEmbeddedSkills() {
+	entries, err := os.ReadDir(skillsDir)
+	if err == nil && len(entries) > 0 {
+		return // user already has skills; never overwrite
+	}
+	os.MkdirAll(skillsDir, 0o755)
+	fs.WalkDir(embeddedSkills, "skills", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel("skills", p)
+		dst := filepath.Join(skillsDir, rel)
+		if d.IsDir() {
+			return os.MkdirAll(dst, 0o755)
+		}
+		data, err := embeddedSkills.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dst, data, 0o644)
+	})
+}
+
+// loadConfig reads the config into a generic map (preserves all fields,
+// including ones added in the future)
+func loadConfig() map[string]interface{} {
+	cfg := map[string]interface{}{}
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return cfg
+	}
+	if json.Unmarshal(data, &cfg) != nil {
+		return map[string]interface{}{}
+	}
+	return cfg
+}
+
+func saveConfig(cfg map[string]interface{}) {
+	ensureDirs()
+	writeJSONFile(configFile, cfg)
+	os.Chmod(configFile, 0o600)
+}
+
+// writeJSONFile writes JSON with indent=2 without escaping HTML/Unicode
+func writeJSONFile(path string, v interface{}) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		return
+	}
+	os.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+func cfgStr(cfg map[string]interface{}, key string) string {
+	s, _ := cfg[key].(string)
+	return s
+}
+
+func cfgMap(cfg map[string]interface{}, key string) map[string]interface{} {
+	m, _ := cfg[key].(map[string]interface{})
+	return m
+}
+
+// sessionPath keeps only letters, digits and -_. in the name
+// (Unicode letters such as CJK are also allowed)
+func sessionPath(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	safe := b.String()
+	if safe == "" {
+		safe = "session"
+	}
+	return filepath.Join(sessDir, safe+".json")
+}
+
+// Message is the canonical internal message form. Each caller serializes it
+// into its provider's wire format (e.g. Responses API function_call items).
+// New fields are omitempty so legacy session JSON still loads.
+type Message struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant requesting tool executions
+	ToolCallID string     `json:"tool_call_id,omitempty"` // tool result: which call this answers
+	Name       string     `json:"name,omitempty"`         // tool result: tool name (for display/journal)
+}
+
+// ToolCall is one tool invocation requested by the model.
+type ToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // JSON string
+}
+
+// Tool is a capability offered to the model. Schema is a JSON Schema object
+// describing the arguments. Run executes the tool with the raw arguments JSON.
+type Tool struct {
+	Name        string
+	Description string
+	Schema      map[string]interface{}
+	Confirm     bool // ask the user before executing
+	Run         func(ctx context.Context, argsJSON string) (string, error)
+}
+
+// CallResult is what a caller returns: assistant text (possibly streamed
+// already) plus any tool calls the model asked for.
+type CallResult struct {
+	Text      string
+	ToolCalls []ToolCall
+}
+
+type Session struct {
+	Name         string    `json:"name"`
+	Provider     string    `json:"provider"`
+	Model        string    `json:"model"`
+	BaseURL      string    `json:"base_url"`
+	SystemPrompt string    `json:"system_prompt"`
+	CreatedAt    string    `json:"created_at"`
+	UpdatedAt    string    `json:"updated_at"`
+	Messages     []Message `json:"messages"`
+}
+
+type sessionEntry struct {
+	name string
+	sess *Session
+}
+
+func listSessions() []sessionEntry {
+	ensureDirs()
+	files, _ := filepath.Glob(filepath.Join(sessDir, "*.json"))
+	type fw struct {
+		path string
+		mod  time.Time
+	}
+	var fws []fw
+	for _, f := range files {
+		if st, err := os.Stat(f); err == nil {
+			fws = append(fws, fw{f, st.ModTime()})
+		}
+	}
+	sort.Slice(fws, func(i, j int) bool { return fws[i].mod.After(fws[j].mod) })
+	var out []sessionEntry
+	for _, f := range fws {
+		data, err := os.ReadFile(f.path)
+		if err != nil {
+			continue
+		}
+		var s Session
+		if json.Unmarshal(data, &s) != nil {
+			continue
+		}
+		out = append(out, sessionEntry{strings.TrimSuffix(filepath.Base(f.path), ".json"), &s})
+	}
+	return out
+}
+
+// saveSession saves the session; empty sessions (0 messages) are skipped unless
+// force is set. Returns (path, saved).
+func saveSession(s *Session, force bool) (string, bool) {
+	if !force && len(s.Messages) == 0 {
+		return "", false
+	}
+	ensureDirs()
+	s.UpdatedAt = time.Now().Format("2006-01-02T15:04:05")
+	path := sessionPath(s.Name)
+	writeJSONFile(path, s)
+	return path, true
+}
+
+func nowISO() string { return time.Now().Format("2006-01-02T15:04:05") }
+
+func defaultSessionName() string { return time.Now().Format("session-20060102-150405") }
+
+func renameSessionFile(oldName, newName string) (bool, string) {
+	oldPath, newPath := sessionPath(oldName), sessionPath(newName)
+	if _, err := os.Stat(oldPath); err != nil {
+		return false, fmt.Sprintf("session %q not found", oldName)
+	}
+	if newPath != oldPath {
+		if _, err := os.Stat(newPath); err == nil {
+			return false, fmt.Sprintf("session %q already exists, pick another name", newName)
+		}
+	}
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		return false, fmt.Sprintf("session %q not found", oldName)
+	}
+	var s map[string]interface{}
+	if json.Unmarshal(data, &s) != nil {
+		return false, fmt.Sprintf("session %q is corrupted", oldName)
+	}
+	s["name"] = newName
+	s["updated_at"] = nowISO()
+	writeJSONFile(newPath, s)
+	if newPath != oldPath {
+		os.Remove(oldPath)
+	}
+	return true, newPath
+}
+
+func loadSession(name string) *Session {
+	data, err := os.ReadFile(sessionPath(name))
+	if err != nil {
+		return nil
+	}
+	var s Session
+	if json.Unmarshal(data, &s) != nil {
+		return nil
+	}
+	return &s
+}
+
+func newSession(name, provider, model, systemPrompt, baseURL string) *Session {
+	return &Session{
+		Name: name, Provider: provider, Model: model, BaseURL: baseURL,
+		SystemPrompt: systemPrompt, CreatedAt: nowISO(), UpdatedAt: nowISO(),
+		Messages: []Message{},
+	}
+}
+
+// exportSession exports the session to a Markdown file; returns (path, overwritten).
+// Message contents are already Markdown, so they are dumped verbatim under role
+// headings; metadata goes into a leading blockquote.
+func exportSession(s *Session, dest string) (string, bool) {
+	var b strings.Builder
+	b.WriteString("# " + s.Name + "\n\n")
+	fmt.Fprintf(&b, "> provider=%s  model=%s  created %s\n", s.Provider, s.Model, s.CreatedAt)
+	if s.SystemPrompt != "" {
+		fmt.Fprintf(&b, "> system: %s\n", s.SystemPrompt)
+	}
+	for _, m := range s.Messages {
+		role := "Assistant"
+		if m.Role == "user" {
+			role = "User"
+		}
+		fmt.Fprintf(&b, "\n## %s\n\n%s\n", role, m.Content)
+	}
+	path := dest
+	if path == "" {
+		path = filepath.Join(exportDir, s.Name+".md")
+	}
+	if strings.HasPrefix(path, "~/") {
+		path = filepath.Join(os.Getenv("HOME"), path[2:])
+	}
+	if filepath.Ext(path) == "" {
+		path += ".md"
+	}
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	_, err := os.Stat(path)
+	overwritten := err == nil
+	os.WriteFile(path, []byte(b.String()), 0o644)
+	return path, overwritten
+}
+
+// --------------------------------------------------------------------------
+// API calls (unified as call(messages, system, model, apiKey) -> string)
+// --------------------------------------------------------------------------
+
+var errInterrupted = fmt.Errorf("interrupted")
+
+func httpPostJSON(ctx context.Context, url string, headers map[string]string, payload interface{}) (map[string]interface{}, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		if ctx.Err() == context.Canceled {
+			return nil, errInterrupted
+		}
+		return nil, fmt.Errorf("network error: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %v", err)
+	}
+	return result, nil
+}
+
+// No overall timeout on streaming requests (long generations could exceed any
+// fixed total deadline); cancellation is done via context.
+var httpClient = &http.Client{}
+
+// retryBackoffs for transient API failures (429/5xx/network); a var so tests
+// can shrink the waits.
+var retryBackoffs = []time.Duration{time.Second, 4 * time.Second, 15 * time.Second}
+
+func asMap(v interface{}) map[string]interface{} {
+	m, _ := v.(map[string]interface{})
+	return m
+}
+
+func asSlice(v interface{}) []interface{} {
+	s, _ := v.([]interface{})
+	return s
+}
+
+func asString(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+func callAnthropic(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, tools []Tool, onDelta, onReasoning func(string)) (CallResult, error) {
+	msgs := []map[string]string{}
+	for _, m := range messages {
+		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})
+	}
+	payload := map[string]interface{}{"model": model, "max_tokens": 8192, "messages": msgs}
+	if system != "" {
+		payload["system"] = system
+	}
+	result, err := httpPostJSON(ctx, "https://api.anthropic.com/v1/messages", map[string]string{
+		"content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01",
+	}, payload)
+	if err != nil {
+		return CallResult{}, err
+	}
+	var b strings.Builder
+	for _, p := range asSlice(result["content"]) {
+		if asString(asMap(p)["type"]) == "text" {
+			b.WriteString(asString(asMap(p)["text"]))
+		}
+	}
+	return CallResult{Text: b.String()}, nil
+}
+
+func callOpenAI(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, tools []Tool, onDelta, onReasoning func(string)) (CallResult, error) {
+	url := "https://api.openai.com/v1/chat/completions"
+	if baseURL != "" {
+		url = strings.TrimRight(baseURL, "/") + "/chat/completions"
+	}
+	msgs := []map[string]string{}
+	if system != "" {
+		msgs = append(msgs, map[string]string{"role": "system", "content": system})
+	}
+	for _, m := range messages {
+		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})
+	}
+	// Newer models (o1/o3 etc.) only accept max_completion_tokens; the legacy
+	// max_tokens parameter is rejected with 400
+	payload := map[string]interface{}{"model": model, "messages": msgs, "max_completion_tokens": 8192}
+	result, err := httpPostJSON(ctx, url, map[string]string{
+		"content-type": "application/json", "authorization": "Bearer " + apiKey,
+	}, payload)
+	if err != nil {
+		return CallResult{}, err
+	}
+	choices := asSlice(result["choices"])
+	if len(choices) == 0 {
+		return CallResult{}, fmt.Errorf("failed to parse response: no choices")
+	}
+	return CallResult{Text: asString(asMap(asMap(choices[0])["message"])["content"])}, nil
+}
+
+func callGemini(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, tools []Tool, onDelta, onReasoning func(string)) (CallResult, error) {
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+	contents := []map[string]interface{}{}
+	for _, m := range messages {
+		role := "user"
+		if m.Role == "assistant" {
+			role = "model"
+		}
+		contents = append(contents, map[string]interface{}{
+			"role": role, "parts": []map[string]string{{"text": m.Content}},
+		})
+	}
+	payload := map[string]interface{}{
+		"contents":         contents,
+		"generationConfig": map[string]interface{}{"maxOutputTokens": 8192},
+	}
+	if system != "" {
+		payload["systemInstruction"] = map[string]interface{}{"parts": []map[string]string{{"text": system}}}
+	}
+	result, err := httpPostJSON(ctx, url, map[string]string{"content-type": "application/json"}, payload)
+	if err != nil {
+		return CallResult{}, err
+	}
+	candidates := asSlice(result["candidates"])
+	if len(candidates) == 0 {
+		return CallResult{Text: "(model returned no content, possibly blocked by safety filters)"}, nil
+	}
+	var b strings.Builder
+	for _, p := range asSlice(asMap(asMap(candidates[0])["content"])["parts"]) {
+		b.WriteString(asString(asMap(p)["text"]))
+	}
+	return CallResult{Text: b.String()}, nil
+}
+
+// responsesInputItems maps canonical Messages to Responses API input items
+// (design §3.7): tool results become function_call_output items, assistant
+// tool requests are replayed as function_call items, everything else becomes
+// role+input_text messages.
+func responsesInputItems(messages []Message) []map[string]interface{} {
+	items := []map[string]interface{}{}
+	for _, m := range messages {
+		switch {
+		case m.Role == "tool":
+			items = append(items, map[string]interface{}{
+				"type": "function_call_output", "call_id": m.ToolCallID, "output": m.Content,
+			})
+		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+			if m.Content != "" {
+				items = append(items, map[string]interface{}{
+					"role":    m.Role,
+					"content": []map[string]string{{"type": "input_text", "text": m.Content}},
+				})
+			}
+			for _, tc := range m.ToolCalls {
+				items = append(items, map[string]interface{}{
+					"type": "function_call", "call_id": tc.ID, "name": tc.Name, "arguments": tc.Arguments,
+				})
+			}
+		default:
+			items = append(items, map[string]interface{}{
+				"role":    m.Role,
+				"content": []map[string]string{{"type": "input_text", "text": m.Content}},
+			})
+		}
+	}
+	return items
+}
+
+// callOpenAIResponses speaks the OpenAI Responses API protocol
+// (POST {baseURL}/responses) with SSE streaming. Many vendors (e.g. Volcengine
+// Ark) expose OpenAI-compatible capability through this protocol.
+func callOpenAIResponses(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, tools []Tool, onDelta, onReasoning func(string)) (CallResult, error) {
+	if baseURL == "" {
+		return CallResult{}, fmt.Errorf("openai_responses provider requires base_url; pass --base-url.")
+	}
+	url := strings.TrimRight(baseURL, "/") + "/responses"
+	items := responsesInputItems(messages)
+	payload := map[string]interface{}{"model": model, "input": items, "stream": true}
+	if system != "" {
+		payload["instructions"] = system
+	}
+	if len(tools) > 0 {
+		ts := []map[string]interface{}{}
+		for _, t := range tools {
+			ts = append(ts, map[string]interface{}{
+				"type": "function", "name": t.Name, "description": t.Description, "parameters": t.Schema,
+			})
+		}
+		payload["tools"] = ts
+		payload["tool_choice"] = "auto"
+	}
+	data, _ := json.Marshal(payload)
+
+	// Retry transient failures (design §3.7): agent loops amplify call counts,
+	// so 429/5xx/network blips are the norm. Backoff 1s/4s/15s; auth and other
+	// 4xx fail fast. Retries heartbeat via onReasoning to keep the spinner alive.
+	var resp *http.Response
+	backoffs := retryBackoffs
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+		if err != nil {
+			return CallResult{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+
+		resp, err = httpClient.Do(req)
+		retryable := false
+		var failMsg string
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				return CallResult{}, errInterrupted
+			}
+			retryable = true
+			failMsg = fmt.Sprintf("network error: %v", err)
+		} else if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			retryable = true
+			failMsg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncateStr(string(body), 200))
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return CallResult{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+		if !retryable {
+			break
+		}
+		if attempt >= len(backoffs) {
+			return CallResult{}, fmt.Errorf("%s (after %d retries)", failMsg, attempt)
+		}
+		if onReasoning != nil {
+			onReasoning(fmt.Sprintf("retry %d/%d after: %s", attempt+1, len(backoffs), failMsg))
+		}
+		select {
+		case <-ctx.Done():
+			return CallResult{}, errInterrupted
+		case <-time.After(backoffs[attempt]):
+		}
+	}
+	defer resp.Body.Close()
+
+	return parseResponsesSSE(ctx, resp.Body, onDelta, onReasoning)
+}
+
+// parseResponsesSSE consumes the SSE stream of the Responses API and returns
+// the accumulated assistant text plus any tool calls. Decoupled from HTTP so
+// recorded streams can be replayed in tests.
+//
+// Event flow (verified against Ark kimi-k3, 2026-09-09): reasoning deltas and
+// output_text deltas interleave with function_call items; argument deltas key
+// on item_id (fc_...) while the model-visible call_id (bash_0) arrives in
+// response.output_item.added, so we map one to the other and keep calls in
+// output_index order.
+func parseResponsesSSE(ctx context.Context, body io.Reader, onDelta, onReasoning func(string)) (CallResult, error) {
+	var full strings.Builder
+	var currentEvent string
+	fcByItem := map[string]*ToolCall{}
+	var fcOrder []string
+	collectCalls := func() []ToolCall {
+		if len(fcOrder) == 0 {
+			return nil
+		}
+		calls := make([]ToolCall, 0, len(fcOrder))
+		for _, id := range fcOrder {
+			calls = append(calls, *fcByItem[id])
+		}
+		return calls
+	}
+	reader := bufio.NewReader(body)
+	for {
+		line, err := reader.ReadString('\n')
+		line = strings.TrimRight(line, "\r\n")
+		if line != "" {
+			if strings.HasPrefix(line, "event:") {
+				currentEvent = strings.TrimSpace(line[len("event:"):])
+			} else if strings.HasPrefix(line, "data:") {
+				dataStr := strings.TrimSpace(line[len("data:"):])
+				if dataStr != "" && dataStr != "[DONE]" {
+					var evt map[string]interface{}
+					if json.Unmarshal([]byte(dataStr), &evt) == nil {
+						etype := currentEvent
+						if etype == "" {
+							etype = asString(evt["type"])
+						}
+						switch etype {
+						case "response.output_text.delta":
+							if d := asString(evt["delta"]); d != "" {
+								full.WriteString(d)
+								if onDelta != nil {
+									onDelta(d)
+								}
+							}
+						case "response.reasoning_summary_text.delta":
+							// Reasoning deltas don't count as reply content; used
+							// only as a "still thinking" heartbeat for the spinner
+							if onReasoning != nil {
+								onReasoning(asString(evt["delta"]))
+							}
+						case "response.output_item.added":
+							if item := asMap(evt["item"]); asString(item["type"]) == "function_call" {
+								itemID := asString(item["id"])
+								fcByItem[itemID] = &ToolCall{ID: asString(item["call_id"]), Name: asString(item["name"])}
+								fcOrder = append(fcOrder, itemID)
+							}
+						case "response.function_call_arguments.delta":
+							if tc, ok := fcByItem[asString(evt["item_id"])]; ok {
+								tc.Arguments += asString(evt["delta"])
+							}
+							// heartbeat so the spinner keeps moving while the
+							// model composes tool arguments
+							if onReasoning != nil {
+								onReasoning("")
+							}
+						case "response.function_call_arguments.done":
+							// deltas already accumulated; .done carries the full
+							// arguments as a fallback
+							if tc, ok := fcByItem[asString(evt["item_id"])]; ok && tc.Arguments == "" {
+								tc.Arguments = asString(evt["arguments"])
+							}
+						case "response.failed":
+							msg := asString(asMap(asMap(evt["response"])["error"])["message"])
+							if msg == "" {
+								msg = "unknown error"
+							}
+							return CallResult{}, fmt.Errorf("upstream error: %s", msg)
+						case "response.completed":
+							return CallResult{Text: full.String(), ToolCalls: collectCalls()}, nil
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				return CallResult{}, errInterrupted
+			}
+			break
+		}
+	}
+	return CallResult{Text: full.String(), ToolCalls: collectCalls()}, nil
+}
+
+// callerFunc is the uniform provider call. tools is the set offered to the
+// model this round (nil/empty for plain chat); providers without tool support
+// ignore it. Callers that support tools surface requests in CallResult.ToolCalls.
+type callerFunc func(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, tools []Tool, onDelta, onReasoning func(string)) (CallResult, error)
+
+var callers = map[string]callerFunc{
+	"anthropic":        callAnthropic,
+	"openai":           callOpenAI,
+	"gemini":           callGemini,
+	"openai_responses": callOpenAIResponses,
+}
+
+func callModel(ctx context.Context, provider string, messages []Message, system, model, apiKey, baseURL string, tools []Tool, onDelta, onReasoning func(string)) (CallResult, error) {
+	fn, ok := callers[provider]
+	if !ok {
+		return CallResult{}, fmt.Errorf("unknown provider: %s", provider)
+	}
+	return fn(ctx, messages, system, model, apiKey, baseURL, tools, onDelta, onReasoning)
+}
+
+// --------------------------------------------------------------------------
+// Agent tools & safety model
+//   bash command classification (chain-aware), output truncation, operation
+//   journal (append-only, secret-redacted), file backups for pre-undo state.
+// --------------------------------------------------------------------------
+
+// commandRisk classifies one shell command line (whole chain).
+type commandRisk int
+
+const (
+	riskReadonly   commandRisk = iota // every chain segment is a whitelisted read-only command
+	riskReversible                    // ordinary change; confirm, log
+	riskDangerous                     // irreversible/destructive; red warning, backup targets when identifiable
+	riskUnknown                       // unrecognized or contains command substitution; treat as reversible+confirm
+)
+
+// readonlyCmds: first-token whitelist. true = plainly read-only; false = needs
+// no entry here (kept in readonlySubcmds or not read-only).
+var readonlyCmds = map[string]bool{
+	"ls": true, "cat": true, "grep": true, "egrep": true, "fgrep": true, "zgrep": true,
+	"head": true, "tail": true, "less": true, "more": true, "wc": true, "sort": true,
+	"uniq": true, "awk": true, "sed": true, "cut": true, "tr": true, "diff": true,
+	"find": true, "which": true, "whereis": true, "type": true, "file": true, "stat": true,
+	"df": true, "du": true, "free": true, "top": true, "htop": true, "ps": true,
+	"uptime": true, "uname": true, "hostname": true, "whoami": true, "id": true, "w": true,
+	"date": true, "cal": true, "env": true, "printenv": true, "echo": true, "printf": true,
+	"pwd": true, "history": true, "alias": true, "jobs": true,
+	"dmesg": true, "vmstat": true, "iostat": true, "mpstat": true, "pidstat": true,
+	"ss": true, "netstat": true, "ip": true, "ifconfig": true, "ping": true, "dig": true,
+	"nslookup": true, "host": true, "traceroute": true,
+	"lsof": true, "lsblk": true, "lsmod": true, "lspci": true, "lsusb": true, "lscpu": true,
+	"journalctl": true, "last": true, "lastlog": true, "crash": true,
+	"zcat": true, "zipinfo": true, "xargs": true, "jq": true, "strings": true,
+	"nm": true, "objdump": true, "readelf": true, "pstack": true,
+}
+
+// readonlySubcmds: read-only only for specific subcommands (checked against the
+// second token of the segment).
+var readonlySubcmds = map[string][]string{
+	"systemctl": {"status", "list-units", "list-unit-files", "is-active", "is-enabled", "show", "cat", "--version"},
+	"kubectl":   {"get", "describe", "logs", "explain", "api-resources", "api-versions", "cluster-info", "top"},
+	"git":       {"status", "log", "diff", "show", "branch", "tag", "remote", "blame", "ls-files", "rev-parse"},
+	"tar":       {"-tf", "-tvf", "--list"},
+	"sysctl":    {"-a", "-n"},
+	"mount":     {""}, // bare `mount` only
+}
+
+// dangerousPatterns matched against the raw (unsplit) command; any hit
+// escalates the whole chain to riskDangerous.
+var dangerousPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\brm\b`),
+	regexp.MustCompile(`\brmdir\b`),
+	regexp.MustCompile(`\bmkfs\b`),
+	regexp.MustCompile(`\bdd\b`),
+	regexp.MustCompile(`\bshred\b`),
+	regexp.MustCompile(`>\s*[^&\s]`), // > file / >> file redirection (overwrite)
+	regexp.MustCompile(`\btruncate\b`),
+	regexp.MustCompile(`\b(kill|pkill|killall)\b`),
+	regexp.MustCompile(`\b(reboot|shutdown|halt|poweroff)\b`),
+	regexp.MustCompile(`\bsystemctl\s+(stop|restart|disable|mask)\b`),
+	regexp.MustCompile(`\bkubectl\s+(delete|drain|cordon|scale)\b`),
+	regexp.MustCompile(`\b(chmod|chown|chgrp)\s+-R\b`),
+	regexp.MustCompile(`\b(useradd|userdel|passwd)\b`),
+	regexp.MustCompile(`\b(iptables|nft)\b`),
+	regexp.MustCompile(`\b(fdisk|parted|sgdisk)\b`),
+	regexp.MustCompile(`\b(swapoff|swapon)\b`),
+}
+
+// splitChain splits a command line on shell chain operators ; && || | while
+// respecting single/double quotes. Best-effort: unmatched quotes degrade to a
+// single segment.
+func splitChain(cmd string) []string {
+	var segs []string
+	var b strings.Builder
+	var quote rune // 0, '\'', or '"'
+	flush := func() {
+		if s := strings.TrimSpace(b.String()); s != "" {
+			segs = append(segs, s)
+		}
+		b.Reset()
+	}
+	runes := []rune(cmd)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if quote != 0 {
+			b.WriteRune(r)
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+			b.WriteRune(r)
+		case ';', '|':
+			flush()
+			if r == '|' && i+1 < len(runes) && runes[i+1] == '|' {
+				i++ // skip second |
+			}
+		case '&':
+			flush()
+			if i+1 < len(runes) && runes[i+1] == '&' {
+				i++ // skip second &
+			}
+		default:
+			b.WriteRune(r)
+		}
+	}
+	flush()
+	return segs
+}
+
+func firstToken(seg string) string {
+	fields := strings.Fields(seg)
+	if len(fields) == 0 {
+		return ""
+	}
+	return filepath.Base(fields[0])
+}
+
+func nthToken(seg string, n int) string {
+	fields := strings.Fields(seg)
+	if len(fields) <= n {
+		return ""
+	}
+	return fields[n]
+}
+
+// isReadonlySegment reports whether a single chain segment is a known
+// read-only invocation (whitelist + subcommand/flag checks).
+func isReadonlySegment(seg string) bool {
+	// Redirects inside the segment (e.g. `cat x > y`) make it a write
+	if strings.Contains(seg, ">") {
+		return false
+	}
+	tok := firstToken(seg)
+	if tok == "" {
+		return false
+	}
+	if subs, ok := readonlySubcmds[tok]; ok {
+		sub := nthToken(seg, 1)
+		for _, s := range subs {
+			if s == sub {
+				return true
+			}
+		}
+		return false
+	}
+	return readonlyCmds[tok]
+}
+
+// nullRedirect matches harmless output discards: 2>/dev/null, 2>&1, &>,
+// >/dev/null 2>&1 etc. These are idiomatic noise suppression, not writes —
+// without stripping them, `du -sh . 2>/dev/null` would match the
+// overwrite-redirect dangerous pattern.
+var nullRedirect = regexp.MustCompile(`\s+(&>|\d*>&\d+|\d*>+\s*/dev/null|>+\s*/dev/null)(\s+2>&1)?`)
+
+// classifyCommand implements the design doc §3.6: split the chain, grade every
+// segment, take the worst. Command substitution $(...)/backticks cannot be
+// statically graded -> riskUnknown. Dangerous raw patterns escalate.
+func classifyCommand(cmd string) commandRisk {
+	cmd = nullRedirect.ReplaceAllString(cmd, "")
+	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") {
+		return riskUnknown
+	}
+	for _, re := range dangerousPatterns {
+		if re.MatchString(cmd) {
+			return riskDangerous
+		}
+	}
+	segs := splitChain(cmd)
+	if len(segs) == 0 {
+		return riskUnknown
+	}
+	for _, seg := range segs {
+		if !isReadonlySegment(seg) {
+			// non-whitelisted but non-dangerous segment: presumably a
+			// reversible change
+			return riskReversible
+		}
+	}
+	return riskReadonly
+}
+
+// --------------------------------------------------------------------------
+// Context management (design §3.8): keep the conversation within a token
+// budget. Stage 1 compresses the oldest tool outputs (structure preserved —
+// tool_call pairing must survive); stage 2 drops the oldest whole turn groups
+// (a user message plus its assistant/tool follow-ups) so no orphaned
+// function_call_output ever reaches the API.
+// --------------------------------------------------------------------------
+
+// estimateTokens is a rough upper-bound heuristic: ASCII ~4 chars/token,
+// CJK ~1.5 tokens/char. Stability over precision (cost control, not billing).
+func estimateTokens(s string) int {
+	score := 0
+	for _, r := range s {
+		if r < 128 {
+			score++
+		} else {
+			score += 6
+		}
+	}
+	return score / 4
+}
+
+func messagesTokens(msgs []Message) int {
+	total := 0
+	for _, m := range msgs {
+		total += estimateTokens(m.Content) + 4
+		for _, tc := range m.ToolCalls {
+			total += estimateTokens(tc.Arguments) + 8
+		}
+	}
+	return total
+}
+
+const compressedToolNote = "[earlier tool output omitted to fit the context budget]"
+
+// trimContext brings msgs under budget. Returns the (possibly shortened) slice
+// and the number of dropped turn groups; a marker user message is prepended
+// when groups were dropped. The input slice is not mutated (compressed entries
+// are copies).
+func trimContext(msgs []Message, budget int) ([]Message, int) {
+	if messagesTokens(msgs) <= budget {
+		return msgs, 0
+	}
+	// Stage 1: compress tool outputs oldest-first until under budget
+	out := make([]Message, len(msgs))
+	copy(out, msgs)
+	for i := range out {
+		if messagesTokens(out) <= budget {
+			return out, 0
+		}
+		if out[i].Role == "tool" && out[i].Content != compressedToolNote {
+			out[i].Content = compressedToolNote + " (tool: " + out[i].Name + ")"
+		}
+	}
+	if messagesTokens(out) <= budget {
+		return out, 0
+	}
+	// Stage 2: drop oldest turn groups (a user message + following
+	// assistant/tool messages up to the next user message)
+	groups := [][]Message{}
+	cur := -1
+	for _, m := range out {
+		if m.Role == "user" {
+			groups = append(groups, nil)
+			cur++
+		}
+		if cur < 0 { // leading non-user messages (shouldn't happen)
+			groups = append(groups, nil)
+			cur++
+		}
+		groups[cur] = append(groups[cur], m)
+	}
+	dropped := 0
+	for len(groups) > 1 && messagesTokens(flattenGroups(groups)) > budget {
+		groups = groups[1:]
+		dropped++
+	}
+	trimmed := flattenGroups(groups)
+	if dropped > 0 {
+		marker := Message{Role: "user", Content: fmt.Sprintf(
+			"[context note: the %d oldest conversation rounds and their tool outputs were omitted to fit the context budget]", dropped)}
+		trimmed = append([]Message{marker}, trimmed...)
+	}
+	return trimmed, dropped
+}
+
+func flattenGroups(groups [][]Message) []Message {
+	var out []Message
+	for _, g := range groups {
+		out = append(out, g...)
+	}
+	return out
+}
+
+// truncateToolOutput keeps the first headLines and last tailLines, and enforces
+// a hard byte cap; the truncation marker carries the omitted line count so the
+// model knows to switch to search/preprocess strategies (§3.4).
+func truncateToolOutput(s string, headLines, tailLines, maxBytes int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > headLines+tailLines {
+		kept := append([]string{}, lines[:headLines]...)
+		omitted := len(lines) - headLines - tailLines
+		kept = append(kept, fmt.Sprintf("[... truncated: %d of %d lines omitted ...]", omitted, len(lines)))
+		kept = append(kept, lines[len(lines)-tailLines:]...)
+		s = strings.Join(kept, "\n")
+	}
+	if len(s) > maxBytes {
+		s = s[:maxBytes] + fmt.Sprintf("\n[... truncated at %d bytes ...]", maxBytes)
+	}
+	return s
+}
+
+// redactSecrets masks common credential shapes before anything hits the journal.
+var (
+	secretDashP   = regexp.MustCompile(`(?i)(-p)(\S+)`)
+	secretBearer  = regexp.MustCompile(`(?i)(bearer\s+)(\S+)`)
+	secretKeyword = regexp.MustCompile(`(?i)((?:password|passwd|secret|token|api[_-]?key|authorization)[\w-]*)(["'\s:=]+)(?:bearer\s+)?(\S+)`)
+)
+
+func redactSecrets(s string) string {
+	s = secretDashP.ReplaceAllString(s, "${1}***")
+	s = secretBearer.ReplaceAllString(s, "${1}***")
+	s = secretKeyword.ReplaceAllString(s, "${1}${2}***")
+	return s
+}
+
+// --------------------------------------------------------------------------
+// Operation journal (§3.6): append-only JSONL per session, mode 0600.
+// --------------------------------------------------------------------------
+
+var journalDir = filepath.Join(appDir, "journal")
+
+type journalEntry struct {
+	Time     string `json:"time"`
+	Session  string `json:"session"`
+	Source   string `json:"source"` // "model" | "user"
+	Tool     string `json:"tool"`
+	Args     string `json:"args"`              // redacted
+	Confirm  string `json:"confirm,omitempty"` // "auto" | "y" | "n" | "always" | "user-direct"
+	Risk     string `json:"risk,omitempty"`
+	Result   string `json:"result,omitempty"` // summary, redacted, truncated
+	ExitCode int    `json:"exit_code,omitempty"`
+	// Undo metadata (§3.6): a file backed up before a destructive op, or a
+	// file created by a write op (undo = delete). Undone marks already-rolled-back.
+	BackupOf string `json:"backup_of,omitempty"`
+	BackupTo string `json:"backup_to,omitempty"`
+	Created  string `json:"created,omitempty"`
+	Undone   bool   `json:"undone,omitempty"`
+}
+
+var backupDir = filepath.Join(appDir, "backups")
+
+// backupFile copies path into the session's backup dir; returns the backup
+// path ("" on failure). Directories are not backed up (too heavy; the journal
+// still records the operation for manual recovery).
+func backupFile(sessionName, path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+	dir := filepath.Join(backupDir, sessionName)
+	if os.MkdirAll(dir, 0o700) != nil {
+		return ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*"))
+	dst := filepath.Join(dir, fmt.Sprintf("%04d-%s", len(matches)+1, filepath.Base(path)))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if os.WriteFile(dst, data, info.Mode()) != nil {
+		return ""
+	}
+	return dst
+}
+
+// rmTargetRe finds file operands of rm (skipping flags); redirectTargetRe finds
+// overwrite targets of > / >> (excluding fd merges and /dev/null).
+var (
+	rmTargetRe       = regexp.MustCompile(`(?:^|&&|\|\||;|\|)\s*rm\s+((?:-\S+\s+)*)([^;&|]+)`)
+	redirectTargetRe = regexp.MustCompile(`(?:^|[^0-9&>])>>?\s*([^&\s|;]+)`)
+)
+
+// backupTargetsFor extracts the files a dangerous command is about to destroy
+// or clobber, best-effort (design §3.6: back up what we can identify).
+func backupTargetsFor(cmd string) []string {
+	var targets []string
+	for _, m := range rmTargetRe.FindAllStringSubmatch(cmd, -1) {
+		for _, f := range strings.Fields(m[2]) {
+			if !strings.HasPrefix(f, "-") {
+				targets = append(targets, f)
+			}
+		}
+	}
+	for _, m := range redirectTargetRe.FindAllStringSubmatch(cmd, -1) {
+		t := m[1]
+		if t != "/dev/null" && !strings.HasPrefix(t, "/dev/fd") {
+			targets = append(targets, t)
+		}
+	}
+	return targets
+}
+
+func journalPath(sessionName string) string {
+	var b strings.Builder
+	for _, r := range sessionName {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	safe := b.String()
+	if safe == "" {
+		safe = "session"
+	}
+	return filepath.Join(journalDir, safe+".jsonl")
+}
+
+func journalWrite(e journalEntry) {
+	os.MkdirAll(journalDir, 0o700)
+	e.Args = redactSecrets(truncateStr(e.Args, 500))
+	e.Result = redactSecrets(truncateStr(e.Result, 500))
+	data, err := json.Marshal(e)
+	if err != nil {
+		return
+	}
+	p := journalPath(e.Session)
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.Write(append(data, '\n'))
+	os.Chmod(p, 0o600)
+}
+
+// undoLatest rolls back the most recent restorable operation in the session
+// journal (design §3.6 reverse WAL replay): a backup is restored to its
+// original path, or an agent-created file is deleted. The undo itself is
+// journaled so repeated calls walk backwards through history. Returns a
+// human-readable outcome.
+func undoLatest(sessionName string) string {
+	data, err := os.ReadFile(journalPath(sessionName))
+	if err != nil {
+		return "(no journal entries for this session)"
+	}
+	var entries []journalEntry
+	for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var e journalEntry
+		if json.Unmarshal([]byte(ln), &e) == nil {
+			entries = append(entries, e)
+		}
+	}
+	// paths already rolled back (recorded by previous undo entries)
+	undone := map[string]bool{}
+	for _, e := range entries {
+		if e.Tool == "undo" {
+			if e.BackupTo != "" {
+				undone[e.BackupTo] = true
+			}
+			if e.Created != "" {
+				undone[e.Created] = true
+			}
+		}
+	}
+	now := time.Now().Format("2006-01-02T15:04:05")
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.Tool == "undo" {
+			continue
+		}
+		switch {
+		case e.BackupTo != "" && !undone[e.BackupTo]:
+			data, err := os.ReadFile(e.BackupTo)
+			if err != nil {
+				return fmt.Sprintf("backup %s missing: %v", e.BackupTo, err)
+			}
+			if err := os.WriteFile(e.BackupOf, data, 0o644); err != nil {
+				return fmt.Sprintf("restore failed: %v", err)
+			}
+			journalWrite(journalEntry{Time: now, Session: sessionName, Source: "user", Tool: "undo",
+				Args: "restore " + e.BackupOf, BackupTo: e.BackupTo, Result: "ok"})
+			return fmt.Sprintf("undone: restored %s (from %s)", e.BackupOf, e.BackupTo)
+		case e.Created != "" && !undone[e.Created]:
+			if err := os.Remove(e.Created); err != nil {
+				return fmt.Sprintf("delete failed: %v", err)
+			}
+			journalWrite(journalEntry{Time: now, Session: sessionName, Source: "user", Tool: "undo",
+				Args: "delete " + e.Created, Created: e.Created, Result: "ok"})
+			return fmt.Sprintf("undone: deleted %s (was created by agent)", e.Created)
+		}
+	}
+	return "(nothing to undo in this session)"
+}
+
+// --------------------------------------------------------------------------
+// bash tool
+// --------------------------------------------------------------------------
+
+var bashWorkDir, _ = os.Getwd() // captured at process start
+
+// bashTimeoutHardCap bounds the model-requested timeout_sec so a runaway
+// value cannot hang the session; the config default agentBashTimeout applies
+// when the model does not ask for more.
+const bashTimeoutHardCap = 600 * time.Second
+
+func runBash(ctx context.Context, argsJSON string) (string, error) {
+	var args struct {
+		Command    string `json:"command"`
+		TimeoutSec int    `json:"timeout_sec"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || strings.TrimSpace(args.Command) == "" {
+		return "", fmt.Errorf("invalid arguments: need {\"command\": \"...\"}")
+	}
+	timeout := agentBashTimeout
+	if args.TimeoutSec > 0 {
+		timeout = time.Duration(args.TimeoutSec) * time.Second
+		if timeout > bashTimeoutHardCap {
+			timeout = bashTimeoutHardCap
+		}
+		if timeout < 5*time.Second {
+			timeout = 5 * time.Second
+		}
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "bash", "-c", args.Command)
+	cmd.Dir = bashWorkDir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	output := truncateToolOutput(out.String(), 200, 50, toolOutputMaxKB*1024)
+	if cctx.Err() == context.DeadlineExceeded {
+		return output + fmt.Sprintf("\n[error] command timed out after %s", timeout), nil
+	}
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			return fmt.Sprintf("%s\n[exit code %d]", output, exit.ExitCode()), nil
+		}
+		return output + "\n[error] " + err.Error(), nil
+	}
+	if output == "" {
+		return "(no output)", nil
+	}
+	return output, nil
+}
+
+// --------------------------------------------------------------------------
+// read_file / search / write_file tools
+// --------------------------------------------------------------------------
+
+func isBinaryData(data []byte) bool {
+	n := len(data)
+	if n > 512 {
+		n = 512
+	}
+	return bytes.IndexByte(data[:n], 0) >= 0
+}
+
+func runReadFile(ctx context.Context, argsJSON string) (string, error) {
+	var args struct {
+		Path   string `json:"path"`
+		Offset int    `json:"offset"` // 1-based starting line
+		Limit  int    `json:"limit"`  // max lines
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || args.Path == "" {
+		return "", fmt.Errorf("invalid arguments: need {\"path\": \"...\", \"offset\": N, \"limit\": M}")
+	}
+	if args.Offset <= 0 {
+		args.Offset = 1
+	}
+	if args.Limit <= 0 {
+		args.Limit = 200
+	}
+	if args.Limit > 2000 {
+		args.Limit = 2000
+	}
+	data, err := os.ReadFile(args.Path)
+	if err != nil {
+		return "", err
+	}
+	if isBinaryData(data) {
+		return fmt.Sprintf("[binary file] %s (%d bytes) — not displayable; use bash tools like strings/nm/objdump/crash to inspect", args.Path, len(data)), nil
+	}
+	lines := strings.Split(string(data), "\n")
+	total := len(lines)
+	if args.Offset > total {
+		return fmt.Sprintf("[offset beyond end] %s has %d lines", args.Path, total), nil
+	}
+	end := args.Offset - 1 + args.Limit
+	if end > total {
+		end = total
+	}
+	out := strings.Join(lines[args.Offset-1:end], "\n")
+	header := fmt.Sprintf("[lines %d-%d of %d]", args.Offset, end, total)
+	if end < total {
+		header += " — more available, use offset to continue"
+	}
+	return header + "\n" + truncateToolOutput(out, 2000, 0, 32768), nil
+}
+
+var searchSkipDirs = map[string]bool{
+	".git": true, "node_modules": true, ".svn": true, "__pycache__": true,
+	".idea": true, ".vscode": true, "vendor": true,
+}
+
+func runSearch(ctx context.Context, argsJSON string) (string, error) {
+	var args struct {
+		Pattern string `json:"pattern"`
+		Path    string `json:"path"`
+		Include string `json:"include"` // optional glob like *.log
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || args.Pattern == "" {
+		return "", fmt.Errorf("invalid arguments: need {\"pattern\": \"...\", \"path\": \"...\", \"include\": \"*.log\"}")
+	}
+	if args.Path == "" {
+		args.Path = "."
+	}
+	re, err := regexp.Compile(args.Pattern)
+	if err != nil {
+		re = regexp.MustCompile(regexp.QuoteMeta(args.Pattern)) // fall back to literal
+	}
+	const maxResults = 100
+	var results []string
+	truncated := false
+	walkFn := func(p string, d os.DirEntry, err error) error {
+		if err != nil || len(results) >= maxResults {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			if searchSkipDirs[d.Name()] && p != args.Path {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if args.Include != "" {
+			if ok, _ := filepath.Match(args.Include, d.Name()); !ok {
+				return nil
+			}
+		}
+		data, err := os.ReadFile(p)
+		if err != nil || isBinaryData(data) {
+			return nil
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			if re.MatchString(line) {
+				results = append(results, fmt.Sprintf("%s:%d: %s", p, i+1, truncateStr(strings.TrimSpace(line), 200)))
+				if len(results) >= maxResults {
+					truncated = true
+					return filepath.SkipAll
+				}
+			}
+		}
+		return nil
+	}
+	info, statErr := os.Stat(args.Path)
+	if statErr != nil {
+		return "", statErr
+	}
+	if info.IsDir() {
+		filepath.WalkDir(args.Path, walkFn)
+	} else {
+		// single file: search it directly (skip binary)
+		if data, err := os.ReadFile(args.Path); err == nil && !isBinaryData(data) {
+			for i, line := range strings.Split(string(data), "\n") {
+				if re.MatchString(line) {
+					results = append(results, fmt.Sprintf("%s:%d: %s", args.Path, i+1, truncateStr(strings.TrimSpace(line), 200)))
+					if len(results) >= maxResults {
+						truncated = true
+						break
+					}
+				}
+			}
+		}
+	}
+	if len(results) == 0 {
+		return fmt.Sprintf("(no matches for %q under %s)", args.Pattern, args.Path), nil
+	}
+	out := strings.Join(results, "\n")
+	if truncated {
+		out += fmt.Sprintf("\n[... truncated at %d matches; narrow the pattern or path ...]", maxResults)
+	}
+	return out, nil
+}
+
+func runWriteFile(ctx context.Context, argsJSON string) (string, error) {
+	var args struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || args.Path == "" {
+		return "", fmt.Errorf("invalid arguments: need {\"path\": \"...\", \"content\": \"...\"}")
+	}
+	if dir := filepath.Dir(args.Path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+	}
+	existed := false
+	if _, err := os.Stat(args.Path); err == nil {
+		existed = true
+	}
+	if err := os.WriteFile(args.Path, []byte(args.Content), 0o644); err != nil {
+		return "", err
+	}
+	verb := "created"
+	if existed {
+		verb = "overwritten"
+	}
+	return fmt.Sprintf("ok: %s %s (%d bytes)", verb, args.Path, len(args.Content)), nil
+}
+
+func readFileToolDef() Tool {
+	return Tool{
+		Name: "read_file",
+		Description: "Read a text file with line offset/limit (1-based). Binary files are detected and reported, not dumped. " +
+			"For large files, read the first ~100 lines to identify the type, then use offset to sample specific regions.",
+		Schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path":   map[string]interface{}{"type": "string", "description": "file path"},
+				"offset": map[string]interface{}{"type": "integer", "description": "1-based starting line (default 1)"},
+				"limit":  map[string]interface{}{"type": "integer", "description": "max lines to read (default 200, cap 2000)"},
+			},
+			"required": []string{"path"},
+		},
+		Confirm: false,
+		Run:     runReadFile,
+	}
+}
+
+func searchToolDef() Tool {
+	return Tool{
+		Name: "search",
+		Description: "Search file contents under a directory (or a single file) for a regex pattern. " +
+			"Returns path:line: match (max 100). Skips binary files and VCS/dependency dirs. " +
+			"Use this to map the error landscape of a log BEFORE reading specific regions.",
+		Schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"pattern": map[string]interface{}{"type": "string", "description": "regex (falls back to literal if invalid)"},
+				"path":    map[string]interface{}{"type": "string", "description": "directory or file (default .)"},
+				"include": map[string]interface{}{"type": "string", "description": "optional filename glob, e.g. *.log"},
+			},
+			"required": []string{"pattern"},
+		},
+		Confirm: false,
+		Run:     runSearch,
+	}
+}
+
+func writeFileToolDef() Tool {
+	return Tool{
+		Name: "write_file",
+		Description: "Write (create or fully overwrite) a text file. Overwriting an existing file asks the user first, " +
+			"and the original is backed up automatically (recoverable via /undo). Use for reports and fix scripts.",
+		Schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path":    map[string]interface{}{"type": "string", "description": "target file path"},
+				"content": map[string]interface{}{"type": "string", "description": "full file content"},
+			},
+			"required": []string{"path", "content"},
+		},
+		Confirm: true,
+		Run:     runWriteFile,
+	}
+}
+
+// --------------------------------------------------------------------------
+// Skills (design §3.5): directory-based playbooks. Two-level loading —
+// frontmatter summaries go into the system prompt at startup; the model loads
+// the full body on demand via the use_skill tool.
+// --------------------------------------------------------------------------
+
+type skillInfo struct {
+	Name        string
+	Description string
+	Activate    []string // activate_when triggers
+	Dir         string
+}
+
+var (
+	skillsDir    = filepath.Join(appDir, "skills")
+	skillsCache  []skillInfo
+	skillsLoaded bool
+)
+
+// skillSearchDirs returns skill roots in priority order: user dir first,
+// then a skills/ dir next to the current working directory (repo checkout).
+func skillSearchDirs() []string {
+	dirs := []string{skillsDir}
+	if cwd, err := os.Getwd(); err == nil {
+		alt := filepath.Join(cwd, "skills")
+		if alt != skillsDir {
+			dirs = append(dirs, alt)
+		}
+	}
+	return dirs
+}
+
+// parseSkillFrontmatter reads the --- ... --- block. Tolerates both `name` and
+// `skill_name` (OpenClaw legacy), multi-line values, and activate_when lists.
+func parseSkillFrontmatter(content string) (name, desc string, activate []string) {
+	if !strings.HasPrefix(content, "---") {
+		return "", "", nil
+	}
+	lines := strings.Split(content, "\n")
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return "", "", nil
+	}
+	key := ""
+	inActivate := false
+	for _, ln := range lines[1:end] {
+		trimmed := strings.TrimSpace(ln)
+		if inActivate && strings.HasPrefix(trimmed, "- ") {
+			activate = append(activate, strings.TrimSpace(trimmed[2:]))
+			continue
+		}
+		inActivate = false
+		if idx := strings.Index(ln, ":"); idx > 0 && !strings.HasPrefix(ln, " ") && !strings.HasPrefix(ln, "\t") && !strings.HasPrefix(trimmed, "-") {
+			key = strings.TrimSpace(ln[:idx])
+			val := strings.TrimSpace(ln[idx+1:])
+			switch key {
+			case "name", "skill_name":
+				name = val
+			case "description":
+				desc = val
+			case "activate_when":
+				inActivate = true
+			default:
+				key = ""
+			}
+			continue
+		}
+		// continuation of a multi-line description
+		if key == "description" && trimmed != "" {
+			desc += " " + trimmed
+		}
+	}
+	return name, desc, activate
+}
+
+// scanSkills (re)builds the skill cache. Later dirs do not override earlier
+// ones for the same skill name (user dir wins).
+func scanSkills() []skillInfo {
+	seen := map[string]bool{}
+	var out []skillInfo
+	for _, root := range skillSearchDirs() {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			p := filepath.Join(root, e.Name(), "SKILL.md")
+			data, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			name, desc, activate := parseSkillFrontmatter(string(data))
+			if name == "" {
+				name = e.Name()
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, skillInfo{Name: name, Description: desc, Activate: activate, Dir: filepath.Join(root, e.Name())})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	skillsCache = out
+	skillsLoaded = true
+	return out
+}
+
+func getSkills() []skillInfo {
+	if !skillsLoaded {
+		return scanSkills()
+	}
+	return skillsCache
+}
+
+// agentSystemBlock is the built-in operating-rules layer of the agent system
+// prompt (design §3.7, layer 2 of 3).
+const agentSystemBlock = `You are a troubleshooting agent running on the user's machine with tool access.
+
+Operating rules:
+- Investigate with tools before concluding: prefer read_file/search over dumping files via bash; use bash for system state (df/ps/dmesg/ss) and for running skill scripts.
+- Large files: never cat them whole. First map with search (error keywords), then read_file the regions around hits. Skill preprocess scripts are preferred for big logs.
+- Extract archives to /tmp/frza-<case>/ (list with tar -tf first; never extract into the user's working directory).
+- Destructive or system-changing commands will be shown to the user for confirmation; propose them when needed, but expect refusal and have a read-only fallback.
+- When done, report: root cause, evidence chain, and concrete fix steps.`
+
+// skillsSystemBlock renders layer 3 (the skill catalog).
+func skillsSystemBlock() string {
+	skills := getSkills()
+	if len(skills) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\nAvailable skill playbooks (call use_skill with the exact name to load the full playbook when the task matches):")
+	for _, s := range skills {
+		b.WriteString("\n- " + s.Name + ": " + truncateStr(s.Description, 300))
+		if len(s.Activate) > 0 {
+			b.WriteString(" (trigger: " + truncateStr(strings.Join(s.Activate, "; "), 150) + ")")
+		}
+	}
+	return b.String()
+}
+
+func composeAgentSystem(userSystem string) string {
+	return userSystem + agentSystemBlock + skillsSystemBlock()
+}
+
+func useSkillToolDef() Tool {
+	return Tool{
+		Name:        "use_skill",
+		Description: "Load the full playbook of a named skill (from the catalog in the system prompt) into context. Use when the user's task matches a skill's description or triggers.",
+		Schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"name": map[string]interface{}{"type": "string", "description": "exact skill name from the catalog"},
+			},
+			"required": []string{"name"},
+		},
+		Confirm: false,
+		Run: func(ctx context.Context, argsJSON string) (string, error) {
+			var args struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || args.Name == "" {
+				return "", fmt.Errorf("invalid arguments: need {\"name\": \"...\"}")
+			}
+			for _, s := range getSkills() {
+				if s.Name == args.Name {
+					data, err := os.ReadFile(filepath.Join(s.Dir, "SKILL.md"))
+					if err != nil {
+						return "", err
+					}
+					body := strings.ReplaceAll(string(data), "{{SKILL_DIR}}", s.Dir)
+					return fmt.Sprintf("[skill %s loaded from %s]\n%s", s.Name, s.Dir, truncateToolOutput(body, 1500, 50, 32768)), nil
+				}
+			}
+			names := []string{}
+			for _, s := range getSkills() {
+				names = append(names, s.Name)
+			}
+			return fmt.Sprintf("[error] skill %q not found; available: %s", args.Name, strings.Join(names, ", ")), nil
+		},
+	}
+}
+
+// bashToolDef is registered under both "bash" and "exec" (legacy skills written
+// for OpenClaw call it exec; §3.5 compatibility).
+func bashToolDef(name string) Tool {
+	return Tool{
+		Name: name,
+		Description: "Run a bash shell command on this machine and return its output. " +
+			"Use for diagnostics: reading logs, checking system state, running read-only inspection commands. " +
+			"Output is truncated (first 200 + last 50 lines, 8KB cap) — for large files prefer grep/sed to narrow first. " +
+			"Default timeout 120s; pass timeout_sec for heavy commands (crash on vmcore, big-log preprocess, large du/find — up to 600s). " +
+			"For very long jobs (>10min), run them in background (nohup ... > /tmp/out 2>&1 &) and poll with tail on later turns.",
+		Schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"command":     map[string]interface{}{"type": "string", "description": "the bash command line to execute"},
+				"timeout_sec": map[string]interface{}{"type": "integer", "description": "optional per-command timeout in seconds (default 120, max 600)"},
+			},
+			"required": []string{"command"},
+		},
+		Confirm: true, // auto-approved only when classifyCommand says riskReadonly
+		Run:     runBash,
+	}
+}
+
+// --------------------------------------------------------------------------
+// Terminal Markdown rendering
+//   Headings/bold/italic/inline code/lists/quotes/hr/code blocks; chroma syntax
+//   highlighting. Falls back to plain text when piped, TERM=dumb, or NO_COLOR.
+// --------------------------------------------------------------------------
+
+func detectColorSupport() bool {
+	if os.Getenv("FRZA_FORCE_COLOR") != "" {
+		return true
+	}
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	if t := os.Getenv("TERM"); t == "" || t == "dumb" {
+		return false
+	}
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+var useColor = detectColorSupport()
+
+var ansiCodes = map[string]string{
+	"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "italic": "\033[3m",
+	"red": "\033[31m", "green": "\033[32m", "gray": "\033[90m",
+	// Inline code: blue-violet rgb(177,185,249), Claude Code's suggestion color
+	"inline_code": "\033[38;2;177;185;249m",
+}
+
+func stylize(text string, styles ...string) string {
+	if !useColor || text == "" {
+		return text
+	}
+	var b strings.Builder
+	for _, s := range styles {
+		b.WriteString(ansiCodes[s])
+	}
+	b.WriteString(text)
+	b.WriteString(ansiCodes["reset"])
+	return b.String()
+}
+
+// Inline elements: code > bold > italic. Go's RE2 has no lookaround, so the
+// word-boundary guards for the underscore forms (protecting snake_case) are
+// written into the pattern as (?:^|[^\w]) boundary character groups — otherwise
+// an underscore inside a word like TIME_WAIT would match a "giant italic" span
+// across half the line and swallow any **bold** in between. Boundary characters
+// are consumed by the match but written back verbatim, matching the semantics
+// of Python's (?<!\w)…(?!\w).
+var inlineRe = regexp.MustCompile(
+	"(\x60[^\x60\n]+\x60)" +
+		"|(\\*\\*[^\\s*](?:[^\n*]*[^\\s*])?\\*\\*)" +
+		"|((?:^|[^\\w])(__[^_\n]+?__)(?:[^\\w]|$))" +
+		"|(\\*[^\\s*](?:[^\n*]*[^\\s*])?\\*)" +
+		"|((?:^|[^\\w])(_[^_\n]+?_)(?:[^\\w]|$))")
+
+func renderInline(line string) string {
+	if !useColor {
+		return line
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range inlineRe.FindAllStringSubmatchIndex(line, -1) {
+		b.WriteString(line[last:m[0]])
+		switch {
+		case m[2] >= 0: // `code`
+			b.WriteString(stylize(line[m[2]+1:m[3]-1], "inline_code"))
+		case m[4] >= 0: // **bold**
+			b.WriteString(stylize(line[m[4]+2:m[5]-2], "bold"))
+		case m[6] >= 0: // boundary+__bold__+boundary (m[6:8] whole, m[8:10] the __..__ body)
+			b.WriteString(line[m[6]:m[8]])
+			b.WriteString(stylize(line[m[8]+2:m[9]-2], "bold"))
+			b.WriteString(line[m[9]:m[7]])
+		case m[10] >= 0: // *it*
+			b.WriteString(stylize(line[m[10]+1:m[11]-1], "italic"))
+		case m[12] >= 0: // boundary+_it_+boundary
+			b.WriteString(line[m[12]:m[14]])
+			b.WriteString(stylize(line[m[14]+1:m[15]-1], "italic"))
+			b.WriteString(line[m[15]:m[13]])
+		}
+		last = m[1]
+	}
+	b.WriteString(line[last:])
+	return b.String()
+}
+
+var (
+	headingRe  = regexp.MustCompile(`^\s{0,3}#{1,6}\s+(.*)$`)
+	hrRe       = regexp.MustCompile(`^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$`)
+	ulRe       = regexp.MustCompile(`^(\s*)[-*+]\s+(.*)$`)
+	olRe       = regexp.MustCompile(`^(\s*)(\d{1,3})[.)]\s+(.*)$`)
+	fenceRe    = regexp.MustCompile("^\\s{0,3}\x60{3}([^\x60]*)\\s*$")
+	tableSepRe = regexp.MustCompile(`^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$`)
+	ansiStrip  = regexp.MustCompile("\\x1b\\[[0-9;]*m")
+)
+
+func renderLine(line string) string {
+	if m := headingRe.FindStringSubmatch(line); m != nil {
+		return stylize(m[1], "bold") // heading keeps default foreground, bold only
+	}
+	if hrRe.MatchString(line) {
+		return stylize(strings.Repeat("─", 40), "gray")
+	}
+	stripped := strings.TrimLeft(line, " \t")
+	if strings.HasPrefix(stripped, ">") {
+		indent := line[:len(line)-len(stripped)]
+		return indent + stylize("▎", "gray") + " " + renderInline(strings.TrimLeft(stripped[1:], " \t"))
+	}
+	if m := ulRe.FindStringSubmatch(line); m != nil {
+		return m[1] + "• " + renderInline(m[2])
+	}
+	if m := olRe.FindStringSubmatch(line); m != nil {
+		return m[1] + m[2] + ". " + renderInline(m[3])
+	}
+	return renderInline(line)
+}
+
+func isTableRow(line string) bool {
+	s := strings.TrimSpace(line)
+	return strings.HasPrefix(s, "|") && strings.Count(s, "|") >= 2
+}
+
+func splitTableRow(line string) []string {
+	s := strings.TrimSpace(line)
+	s = strings.TrimPrefix(s, "|")
+	s = strings.TrimSuffix(s, "|")
+	parts := strings.Split(s, "|")
+	for i, c := range parts {
+		// Expand tabs to a fixed 4 spaces: tabs jump to multiples of 8 in the
+		// terminal, making width unpredictable
+		parts[i] = strings.ReplaceAll(strings.TrimSpace(c), "\t", "    ")
+	}
+	return parts
+}
+
+func colAlign(cell string) string {
+	cell = strings.TrimSpace(cell)
+	left, right := strings.HasPrefix(cell, ":"), strings.HasSuffix(cell, ":")
+	if left && right {
+		return "center"
+	}
+	if right {
+		return "right"
+	}
+	return "left"
+}
+
+// dispWidth returns the display width: ANSI escapes stripped, then terminal
+// columns counted by grapheme cluster (uniseg handles ZWJ/VS16/combining marks)
+func dispWidth(s string) int {
+	return uniseg.StringWidth(ansiStrip.ReplaceAllString(s, ""))
+}
+
+func padCell(s string, width int, align string) string {
+	gap := width - dispWidth(s)
+	if gap <= 0 {
+		return s
+	}
+	switch align {
+	case "right":
+		return strings.Repeat(" ", gap) + s
+	case "center":
+		left := gap / 2
+		return strings.Repeat(" ", left) + s + strings.Repeat(" ", gap-left)
+	}
+	return s + strings.Repeat(" ", gap)
+}
+
+// pickStyle guesses light/dark terminal background from COLORFGBG and picks a
+// chroma style (github for light backgrounds, monokai for dark)
+func pickStyle() string {
+	cfb := os.Getenv("COLORFGBG")
+	if i := strings.LastIndex(cfb, ";"); i >= 0 {
+		switch cfb[i+1:] {
+		case "7", "15":
+			return "github"
+		}
+	}
+	return "monokai"
+}
+
+var (
+	bgStrip1 = regexp.MustCompile(`;48;5;\d+`)
+	bgStrip2 = regexp.MustCompile(`;48;2;\d+;\d+;\d+`)
+	bgStrip3 = regexp.MustCompile("\\x1b\\[48;[25];[\\d;]*m")
+)
+
+// stripChromaBG strips the style's own background colors, keeping only
+// foreground colors (so the terminal background shows through)
+func stripChromaBG(text string) string {
+	text = bgStrip1.ReplaceAllString(text, "")
+	text = bgStrip2.ReplaceAllString(text, "")
+	return bgStrip3.ReplaceAllString(text, "")
+}
+
+func isNumberToken(t chroma.TokenType) bool {
+	return t >= chroma.LiteralNumber && t < chroma.LiteralNumber+100
+}
+
+var (
+	numPlainRe   = regexp.MustCompile(`^\d+(\.\d+)?$`)
+	numAccRe     = regexp.MustCompile(`^[0-9a-fA-FtT./:-]+$`)
+	numCompundRe = regexp.MustCompile(`^[0-9a-fA-FtT]+([./:-][0-9a-fA-FtT]+){2,}$`)
+	numBareRe    = regexp.MustCompile(`^\d+$`)
+)
+
+// demoteLine demotes pseudo-number tokens inside "number+separator+number"
+// compound fragments (IP/date/time/MAC/version) within a single line
+func demoteLine(tokens []chroma.Token) ([]chroma.Token, bool) {
+	out := []chroma.Token{}
+	demoted := false
+	i, n := 0, len(tokens)
+	for i < n {
+		t := tokens[i]
+		if isNumberToken(t.Type) && numPlainRe.MatchString(t.Value) {
+			j := i + 1
+			acc := t.Value
+			for j < n && numAccRe.MatchString(tokens[j].Value) {
+				acc += tokens[j].Value
+				j++
+			}
+			if numCompundRe.MatchString(acc) {
+				for k := i; k < j; k++ {
+					out = append(out, chroma.Token{Type: chroma.Text, Value: tokens[k].Value})
+				}
+				demoted = true
+				i = j
+				continue
+			}
+		}
+		out = append(out, t)
+		i++
+	}
+	return out, demoted
+}
+
+// demoteCompoundNumberTokens runs compound-number demotion per line; once a
+// fragment is demoted on a line, stray bare numbers on that line are demoted
+// too (avoiding a half-colored timestamp line)
+func demoteCompoundNumberTokens(tokens []chroma.Token) []chroma.Token {
+	var lines [][]chroma.Token
+	var cur []chroma.Token
+	for _, t := range tokens {
+		cur = append(cur, t)
+		if strings.Contains(t.Value, "\n") {
+			lines = append(lines, cur)
+			cur = nil
+		}
+	}
+	if len(cur) > 0 {
+		lines = append(lines, cur)
+	}
+	out := []chroma.Token{}
+	for _, line := range lines {
+		processed, demoted := demoteLine(line)
+		if demoted {
+			for i, t := range processed {
+				if isNumberToken(t.Type) && numBareRe.MatchString(t.Value) {
+					processed[i] = chroma.Token{Type: chroma.Text, Value: t.Value}
+				}
+			}
+		}
+		out = append(out, processed...)
+	}
+	return out
+}
+
+// Prompt prefix of shell session blocks ([user@host ~]# / user@host:~$);
+// the bash lexer doesn't understand prompts, so they are handled separately
+var shellSessionLangs = map[string]bool{
+	"bash": true, "sh": true, "shell": true, "zsh": true,
+	"console": true, "shell-session": true, "": true,
+}
+var promptRe = regexp.MustCompile(`^(\s*(?:\[[\w.\-]+@[\w.\-]+[^\]]*\]|[\w.\-]+@[\w.\-]+:[^\n]*?)[#$]\s*)(.*)$`)
+
+func lexFragment(lexer chroma.Lexer, s string) []chroma.Token {
+	var toks []chroma.Token
+	it, err := lexer.Tokenise(nil, s)
+	if err != nil {
+		return []chroma.Token{{Type: chroma.Text, Value: s}}
+	}
+	for t := it(); t != chroma.EOF; t = it() {
+		toks = append(toks, t)
+	}
+	return toks
+}
+
+// lexShellSession handles shell session blocks per line: the prompt prefix
+// stays plain text, the command after #/$ still gets bash highlighting
+func lexShellSession(code string, lexer chroma.Lexer) []chroma.Token {
+	out := []chroma.Token{}
+	for _, line := range strings.Split(code, "\n") {
+		if m := promptRe.FindStringSubmatch(line); m != nil {
+			out = append(out, chroma.Token{Type: chroma.Text, Value: m[1]})
+			if m[2] != "" {
+				out = append(out, lexFragment(lexer, m[2])...)
+			}
+		} else if line != "" {
+			out = append(out, lexFragment(lexer, line)...)
+		}
+		out = append(out, chroma.Token{Type: chroma.Text, Value: "\n"})
+	}
+	return out
+}
+
+func highlightCode(code, lang string) string {
+	var lexer chroma.Lexer
+	if lang != "" {
+		lexer = lexers.Get(lang)
+	}
+	if lexer == nil {
+		lexer = lexers.Fallback
+	}
+	var toks []chroma.Token
+	hasPrompt := false
+	for _, l := range strings.Split(code, "\n") {
+		if promptRe.MatchString(l) {
+			hasPrompt = true
+			break
+		}
+	}
+	if shellSessionLangs[strings.ToLower(lang)] && hasPrompt {
+		toks = lexShellSession(code, lexer)
+	} else {
+		toks = lexFragment(lexer, code)
+	}
+	toks = demoteCompoundNumberTokens(toks)
+	// Truecolor formatter: emits the style's exact RGB values, more faithful to
+	// the theme than 256-color approximation (whose mapping differs between
+	// chroma and pygments anyway)
+	formatter := formatters.Get("terminal16m")
+	var buf bytes.Buffer
+	if err := formatter.Format(&buf, styles.Get(pickStyle()), chroma.Literator(toks...)); err != nil {
+		return code
+	}
+	return stripChromaBG(buf.String())
+}
+
+// --------------------------------------------------------------------------
+// ASCII box-art realignment in code blocks
+//   Models draw ┌─┐│└─┘ diagrams by "mentally" counting CJK widths and are
+//   often off by 1-2 columns, leaving ragged right edges. This realigns box
+//   lines in untagged/text code blocks by padding every vertical edge rightward
+//   to the group's widest column. Insert-only, never deletes content.
+// --------------------------------------------------------------------------
+
+// Box-drawing chars with "vertical edge" semantics; ─ ┬ ┴ ┼ are horizontal/crossing
+var boxVBars = map[rune]bool{'│': true, '┌': true, '┐': true, '└': true, '┘': true, '├': true, '┤': true}
+
+// Only realign blocks with these language tags, avoiding box chars inside
+// e.g. python string literals
+var boxArtLangs = map[string]bool{"": true, "text": true, "txt": true, "plain": true}
+
+// Max column spread allowed for edges at the same level: beyond that the boxes
+// are intentionally different widths, or an anomalous line sneaked in
+const boxEdgeTolerance = 4
+
+type boxEdge struct {
+	byteIdx int
+	col     int
+}
+
+// boxEdges returns (byte_index, display_col) of all vertical-edge chars in the
+// line; lines containing tabs return nil (column math unpredictable)
+func boxEdges(line string) []boxEdge {
+	if strings.Contains(line, "\t") {
+		return nil
+	}
+	var edges []boxEdge
+	col := 0
+	g := uniseg.NewGraphemes(line)
+	for g.Next() {
+		cl := g.Str()
+		from, _ := g.Positions()
+		if r, ok := singleRune(cl); ok && boxVBars[r] {
+			edges = append(edges, boxEdge{from, col})
+		}
+		col += uniseg.StringWidth(cl)
+	}
+	return edges
+}
+
+func singleRune(s string) (rune, bool) {
+	rs := []rune(s)
+	if len(rs) == 1 {
+		return rs[0], true
+	}
+	return 0, false
+}
+
+// alignBoxEdge aligns each line's (-level)-th vertical edge from the right to
+// one display column (level=-1 is the outermost right edge). Only pushes edges
+// rightward (insert spaces before an edge; insert ─ for horizontal borders).
+func alignBoxEdge(group []string, level int) []string {
+	type entry struct {
+		idx int
+		e   boxEdge
+	}
+	var particip []entry
+	for idx, line := range group {
+		edges := boxEdges(line)
+		// level=-1 needs at least two edges; level=-2 needs at least three
+		// (with two, the 2nd-from-right is the left border and must not move)
+		if edges != nil && len(edges) >= 1-level {
+			particip = append(particip, entry{idx, edges[len(edges)+level]})
+		}
+	}
+	if len(particip) < 2 {
+		return group
+	}
+	minC, maxC := particip[0].e.col, particip[0].e.col
+	for _, p := range particip[1:] {
+		if p.e.col < minC {
+			minC = p.e.col
+		}
+		if p.e.col > maxC {
+			maxC = p.e.col
+		}
+	}
+	if maxC-minC > boxEdgeTolerance {
+		return group
+	}
+	out := append([]string(nil), group...)
+	for _, p := range particip {
+		gap := maxC - p.e.col
+		if gap <= 0 {
+			continue
+		}
+		line := out[p.idx]
+		// Horizontal borders (┌──┐/└──┘) get ─ to stay continuous; content lines get spaces
+		fill := " "
+		if p.e.byteIdx > 0 && lastRuneIs(line[:p.e.byteIdx], '─') {
+			fill = "─"
+		}
+		out[p.idx] = line[:p.e.byteIdx] + strings.Repeat(fill, gap) + line[p.e.byteIdx:]
+	}
+	return out
+}
+
+func lastRuneIs(s string, r rune) bool {
+	rs := []rune(s)
+	return len(rs) > 0 && rs[len(rs)-1] == r
+}
+
+// realignGroup: fully uniform structure (same edge count on every line, e.g.
+// several identical side-by-side boxes) aligns every edge level from innermost
+// to outermost; mixed structure (nested boxes / annotations) aligns only the
+// two outermost right-edge levels — deeper levels risk mismapping and are left
+// to the spread guard.
+func realignGroup(group []string) []string {
+	counts := map[int]bool{}
+	for _, l := range group {
+		counts[len(boxEdges(l))] = true
+	}
+	if len(counts) == 1 {
+		var nEdges int
+		for n := range counts {
+			nEdges = n
+		}
+		for level := -(nEdges - 1); level < 0; level++ {
+			group = alignBoxEdge(group, level)
+		}
+	} else {
+		group = alignBoxEdge(group, -2)
+		group = alignBoxEdge(group, -1)
+	}
+	return group
+}
+
+// realignBoxArt realigns hand-drawn box diagrams in a code block; a run of
+// consecutive box lines (>= 3 lines) forms one box group
+func realignBoxArt(code string) string {
+	raw := strings.Split(code, "\n")
+	lines := make([]string, len(raw))
+	for i, l := range raw {
+		lines[i] = strings.TrimRight(l, " \t")
+	}
+	out := []string{}
+	i, n := 0, len(lines)
+	for i < n {
+		if boxEdges(lines[i]) != nil {
+			j := i
+			for j < n && boxEdges(lines[j]) != nil {
+				j++
+			}
+			group := lines[i:j]
+			if len(group) >= 3 {
+				group = realignGroup(group)
+			}
+			out = append(out, group...)
+			i = j
+		} else {
+			out = append(out, lines[i])
+			i++
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// --------------------------------------------------------------------------
+// Markdown renderer (line-fed; code blocks and tables accumulate before
+// one-shot formatting)
+// --------------------------------------------------------------------------
+
+type markdownRenderer struct {
+	inCode       bool
+	codeLang     string
+	codeLines    []string
+	tablePending *string
+	inTable      bool
+	tableRows    []string
+	tableAligns  []string
+}
+
+func (r *markdownRenderer) feedLine(line string) (string, bool) {
+	out := []string{}
+
+	// Table state machine (| inside code blocks doesn't trigger tables)
+	if !r.inCode {
+		if r.tablePending != nil {
+			if tableSepRe.MatchString(line) {
+				r.inTable = true
+				r.tableRows = []string{*r.tablePending}
+				for _, c := range splitTableRow(line) {
+					r.tableAligns = append(r.tableAligns, colAlign(c))
+				}
+				r.tablePending = nil
+				return "", false
+			}
+			out = append(out, renderLine(*r.tablePending))
+			r.tablePending = nil
+		}
+		if r.inTable {
+			if isTableRow(line) {
+				r.tableRows = append(r.tableRows, line)
+				return "", false
+			}
+			out = append(out, r.renderTable())
+			r.inTable = false
+			r.tableRows = nil
+		}
+	}
+
+	// Code block fence
+	if m := fenceRe.FindStringSubmatch(line); m != nil {
+		if r.inCode {
+			r.inCode = false
+			out = append(out, r.renderCode())
+			r.codeLines = nil
+		} else {
+			r.inCode = true
+			r.codeLang = strings.TrimSpace(m[1])
+			r.codeLines = nil
+		}
+		return strings.Join(out, "\n"), len(out) > 0
+	}
+	if r.inCode {
+		r.codeLines = append(r.codeLines, line)
+		return strings.Join(out, "\n"), len(out) > 0
+	}
+
+	// Candidate table header: hold pending, check if next line is a separator
+	if isTableRow(line) {
+		r.tablePending = &line
+		return strings.Join(out, "\n"), len(out) > 0
+	}
+
+	out = append(out, renderLine(line))
+	return strings.Join(out, "\n"), true
+}
+
+// flush is called at end of input: renders any pending table or unclosed code block
+func (r *markdownRenderer) flush() (string, bool) {
+	out := []string{}
+	if r.tablePending != nil {
+		out = append(out, renderLine(*r.tablePending))
+		r.tablePending = nil
+	}
+	if r.inTable {
+		out = append(out, r.renderTable())
+		r.inTable = false
+		r.tableRows = nil
+	}
+	if r.inCode {
+		r.inCode = false
+		if len(r.codeLines) > 0 {
+			out = append(out, r.renderCode())
+		}
+	}
+	return strings.Join(out, "\n"), len(out) > 0
+}
+
+func (r *markdownRenderer) renderTable() string {
+	rows := [][]string{}
+	ncols := 0
+	for _, row := range r.tableRows {
+		cells := splitTableRow(row)
+		if len(cells) > ncols {
+			ncols = len(cells)
+		}
+		rows = append(rows, cells)
+	}
+	for i, row := range rows {
+		for len(row) < ncols {
+			row = append(row, "")
+		}
+		rows[i] = row
+	}
+	aligns := append([]string(nil), r.tableAligns...)
+	for len(aligns) < ncols {
+		aligns = append(aligns, "left")
+	}
+	aligns = aligns[:ncols]
+	rendered := make([][]string, len(rows))
+	for i, row := range rows {
+		rc := make([]string, ncols)
+		for j, c := range row {
+			rc[j] = renderInline(c)
+		}
+		rendered[i] = rc
+	}
+	widths := make([]int, ncols)
+	for j := 0; j < ncols; j++ {
+		for _, row := range rendered {
+			if w := dispWidth(row[j]); w > widths[j] {
+				widths[j] = w
+			}
+		}
+	}
+	segs := make([]string, ncols)
+	for j, w := range widths {
+		segs[j] = strings.Repeat("─", w+2) // +2 for the space padding on both sides
+	}
+	border := func(left, mid, right string) string {
+		return stylize(left+strings.Join(segs, mid)+right, "gray")
+	}
+	makeRow := func(cells []string, cellStyle string) string {
+		parts := make([]string, ncols)
+		for i := 0; i < ncols; i++ {
+			c := cells[i]
+			if cellStyle != "" {
+				c = stylize(c, cellStyle)
+			}
+			parts[i] = padCell(c, widths[i], aligns[i])
+		}
+		bar := stylize("│", "gray")
+		return bar + " " + strings.Join(parts, " "+bar+" ") + " " + bar
+	}
+	// Fully enclosed box: top/bottom borders + separators between header and rows
+	lines := []string{border("┌", "┬", "┐")}
+	lines = append(lines, makeRow(rendered[0], "bold"))
+	lines = append(lines, border("├", "┼", "┤"))
+	for i, row := range rendered[1:] {
+		if i > 0 {
+			lines = append(lines, border("├", "┼", "┤"))
+		}
+		lines = append(lines, makeRow(row, ""))
+	}
+	lines = append(lines, border("└", "┴", "┘"))
+	return strings.Join(lines, "\n")
+}
+
+func (r *markdownRenderer) renderCode() string {
+	code := strings.Join(r.codeLines, "\n")
+	if boxArtLangs[strings.ToLower(r.codeLang)] {
+		// Hand-drawn diagrams are often ragged from CJK width miscounts; realign first
+		code = realignBoxArt(code)
+	}
+	bar := stylize("▎", "gray")
+	if useColor {
+		rendered := strings.TrimRight(highlightCode(code, r.codeLang), "\n")
+		lines := strings.Split(rendered, "\n")
+		for i, l := range lines {
+			lines[i] = bar + " " + l
+		}
+		return strings.Join(lines, "\n")
+	}
+	if code == "" {
+		return ""
+	}
+	lines := strings.Split(code, "\n")
+	for i, l := range lines {
+		lines[i] = bar + " " + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderMarkdown(text string) string {
+	r := &markdownRenderer{}
+	out := []string{}
+	for _, line := range strings.Split(text, "\n") {
+		if rendered, ok := r.feedLine(line); ok {
+			out = append(out, rendered)
+		}
+	}
+	if tail, ok := r.flush(); ok {
+		out = append(out, tail)
+	}
+	return strings.Join(out, "\n")
+}
+
+// streamRenderer is a line-buffered renderer for streaming output: renders only
+// complete lines (Markdown syntax closes per line)
+type streamRenderer struct {
+	r   *markdownRenderer
+	buf string
+}
+
+func newStreamRenderer() *streamRenderer {
+	return &streamRenderer{r: &markdownRenderer{}}
+}
+
+func (s *streamRenderer) feed(text string) {
+	s.buf += text
+	for strings.Contains(s.buf, "\n") {
+		i := strings.Index(s.buf, "\n")
+		line := s.buf[:i]
+		s.buf = s.buf[i+1:]
+		s.emit(line)
+	}
+}
+
+func (s *streamRenderer) finish() {
+	if s.buf != "" {
+		s.emit(s.buf)
+		s.buf = ""
+	}
+	if tail, ok := s.r.flush(); ok {
+		fmt.Println(tail)
+	}
+}
+
+func (s *streamRenderer) emit(line string) {
+	if rendered, ok := s.r.feedLine(line); ok {
+		fmt.Println(rendered)
+	}
+}
+
+// --------------------------------------------------------------------------
+// ThinkingIndicator: animated indicator while waiting for the model (refreshed
+// from a goroutine). Style replicates Claude Code's spinner: ✻ + random verb +
+// shimmer sweep.
+// --------------------------------------------------------------------------
+
+var thinkingVerbs = []string{"Thinking", "Pondering", "Mulling", "Brewing", "Wondering",
+	"Deliberating", "Computing", "Searching", "Weaving", "Wandering"}
+
+const (
+	shimmerBase = "\033[38;2;147;165;255m" // claudeBlue_FOR_SYSTEM_SPINNER
+	shimmerHot  = "\033[38;2;177;195;255m" // claudeBlueShimmer
+	shimmerW    = 4
+)
+
+type thinkingIndicator struct {
+	stopCh  chan struct{}
+	doneCh  chan struct{}
+	mu      sync.Mutex
+	state   string
+	t0      time.Time
+	started bool
+	rng     *rand2
+}
+
+type rand2 struct{ mu sync.Mutex }
+
+func (r *rand2) pick() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return thinkingVerbs[int(time.Now().UnixNano()%int64(len(thinkingVerbs)))]
+}
+
+func newThinkingIndicator() *thinkingIndicator {
+	return &thinkingIndicator{state: "Waiting", rng: &rand2{}}
+}
+
+func (ti *thinkingIndicator) start() {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return
+	}
+	ti.t0 = time.Now()
+	ti.stopCh = make(chan struct{})
+	ti.doneCh = make(chan struct{})
+	ti.started = true
+	go ti.run()
+}
+
+func (ti *thinkingIndicator) setState(state string) {
+	ti.mu.Lock()
+	defer ti.mu.Unlock()
+	if ti.state == "Waiting" {
+		ti.state = state
+	}
+}
+
+func (ti *thinkingIndicator) shimmerText(text string, frame int) string {
+	if !useColor {
+		return text
+	}
+	runes := []rune(text)
+	n := len(runes)
+	cycle := n + shimmerW
+	pos := frame % cycle
+	var b strings.Builder
+	for i, ch := range runes {
+		if pos <= i && i < pos+shimmerW {
+			b.WriteString(shimmerHot)
+		} else {
+			b.WriteString(shimmerBase)
+		}
+		b.WriteRune(ch)
+	}
+	b.WriteString("\033[0m")
+	return b.String()
+}
+
+func (ti *thinkingIndicator) run() {
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
+	frame := 0
+	for {
+		select {
+		case <-ti.stopCh:
+			close(ti.doneCh)
+			return
+		case <-ticker.C:
+			ti.mu.Lock()
+			state := ti.state
+			ti.mu.Unlock()
+			elapsed := int(time.Since(ti.t0).Seconds())
+			ts := fmt.Sprintf("%ds", elapsed)
+			if elapsed >= 60 {
+				ts = fmt.Sprintf("%dm %ds", elapsed/60, elapsed%60)
+			}
+			text := fmt.Sprintf("✻ %s %s", state, ts)
+			fmt.Fprintf(os.Stdout, "\r%s\033[K", ti.shimmerText(text, frame))
+			frame++
+		}
+	}
+}
+
+func (ti *thinkingIndicator) stop() {
+	if !ti.started {
+		return
+	}
+	close(ti.stopCh)
+	<-ti.doneCh
+	ti.started = false
+	fmt.Fprint(os.Stdout, "\r\033[K") // erase the indicator line
+}
+
+func (ti *thinkingIndicator) randomVerb() { ti.setState(ti.rng.pick()) }
+
+// --------------------------------------------------------------------------
+// REPL
+// --------------------------------------------------------------------------
+
+func formatHistory(messages []Message) string {
+	out := []string{}
+	for _, m := range messages {
+		out = append(out, "")
+		if m.Role == "user" {
+			for _, line := range strings.Split(m.Content, "\n") {
+				out = append(out, stylize("> ", "green")+line)
+			}
+		} else {
+			out = append(out, renderMarkdown(m.Content))
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// pageText views long text through a pager ($PAGER, default less -R -F -X);
+// falls back to plain print when not a tty or no pager is available
+func pageText(text string) {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		fmt.Println(text)
+		return
+	}
+	pager := os.Getenv("PAGER")
+	if pager == "" {
+		pager = "less"
+	}
+	parts := strings.Fields(pager)
+	if filepath.Base(parts[0]) == "less" {
+		parts = append(parts, "-R", "-F", "-X")
+	}
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Stdin = strings.NewReader(text)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Println(text)
+	}
+}
+
+// Slash commands offered for Tab completion
+var replCommands = []string{
+	"/agent", "/baseurl", "/clear", "/continue", "/edit", "/exit", "/export", "/help", "/history",
+	"/journal", "/list", "/model", "/new", "/quit", "/reload-skills", "/rename", "/resume", "/save", "/skills", "/system", "/undo",
+}
+
+type frzCompleter struct{}
+
+// Do implements readline.AutoCompleter: session names after /resume,
+// command names at line start
+func (frzCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	s := string(line[:pos])
+	if strings.HasPrefix(s, "/resume ") || strings.HasPrefix(s, "/resume\t") {
+		idx := strings.LastIndexAny(s, " \t")
+		prefix := s[idx+1:]
+		var out [][]rune
+		for _, e := range listSessions() {
+			if strings.HasPrefix(e.name, prefix) {
+				out = append(out, []rune(e.name[len(prefix):]))
+			}
+		}
+		return out, len([]rune(prefix))
+	}
+	if strings.HasPrefix(s, "/") && !strings.ContainsAny(s, " \t") {
+		var out [][]rune
+		for _, c := range replCommands {
+			if strings.HasPrefix(c, s) {
+				out = append(out, []rune(c[len(s):]))
+			}
+		}
+		return out, len([]rune(s))
+	}
+	return nil, 0
+}
+
+const helpText = `Available commands:
+  Sessions
+    /save [name]         Save current session (uses current name if omitted)
+    /rename <name>       Rename current session
+    /resume [name]       Switch to another session (latest session if omitted)
+    /list                List all saved sessions
+    /new [name]          Start a new session
+    /export [file]       Export current session to Markdown
+                         (default ~/.frza/exports/<session>.md)
+
+  Session settings
+    /system [prompt]     View or set the system prompt
+    /model [name]        View or switch model
+    /baseurl [url]       View or set custom API base url (required by
+                         openai_responses and similar providers)
+
+  Agent
+    /agent [on|off]      View or toggle agent mode (model can run tools such as
+                         bash; read-only commands auto-run, changes ask first)
+    /journal             Show the operation journal of this session (last 20)
+    /undo                Roll back the most recent file change made by the agent
+    /skills              List available skill playbooks
+    /reload-skills       Rescan skill directories (after adding/editing skills)
+    /continue            Keep investigating after the agent round limit is hit
+
+  Other
+    !cmd                 Run a shell command directly (output shown only)
+    !!cmd                Run a shell command and feed its output to the model
+    /edit                Compose a multi-line message in your editor (great for
+                         pasting long logs/questions); sent on save & exit
+    /history [N]         Show conversation history (N = last N rounds only;
+                         long output is paged automatically)
+    /clear               Clear current session history (keeps system prompt)
+    /help                Show this help
+    /exit or /quit       Save and exit
+`
+
+const editHint = `# Type your message below (multi-line OK). It is sent when you
+# save and exit the editor. These two lines are removed automatically;
+# empty content cancels.
+`
+
+// editInEditor opens $VISUAL/$EDITOR (default vi) to compose a multi-line
+// message; returns "" when cancelled/empty. Goes through a temp file rather
+// than terminal line buffering, so there is no 1024-byte canonical-mode limit.
+func editInEditor() string {
+	editor := os.Getenv("VISUAL")
+	if editor == "" {
+		editor = os.Getenv("EDITOR")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+	f, err := os.CreateTemp("", "frza-edit-*.md")
+	if err != nil {
+		fmt.Println(stylize("[error] cannot create temp file: "+err.Error(), "red"))
+		return ""
+	}
+	path := f.Name()
+	f.WriteString(editHint)
+	f.Close()
+	defer os.Remove(path)
+
+	parts := append(strings.Fields(editor), path)
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		if _, ok := err.(*exec.Error); ok {
+			fmt.Println(stylize(fmt.Sprintf("[error] editor not found: %s (set it via export EDITOR=vim)", editor), "red"))
+		} else {
+			fmt.Println("(editor exited abnormally, cancelled)")
+		}
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	text := string(data)
+	// Only strip the hint lines if they are exactly as written: a blanket
+	// "ignore lines starting with #" rule would eat log content such as
+	// root prompts (# iptables -L)
+	if strings.HasPrefix(text, editHint) {
+		text = text[len(editHint):]
+	}
+	return strings.TrimSpace(text)
+}
+
+// confirmFunc asks the user a question and returns their answer ("y"/"n"/"a").
+type confirmFunc func(prompt string) string
+
+// agentRegistry maps every accepted tool name to its definition. "bash" and
+// "exec" are the same tool (exec = legacy OpenClaw skill name, §3.5).
+var agentRegistry = map[string]Tool{
+	"bash":       bashToolDef("bash"),
+	"exec":       bashToolDef("exec"),
+	"read_file":  readFileToolDef(),
+	"search":     searchToolDef(),
+	"write_file": writeFileToolDef(),
+	"use_skill":  useSkillToolDef(),
+}
+
+// agentToolsOffered lists the tools sent to the model (one entry per unique
+// definition; aliases stay lookup-only to save tokens).
+func agentToolsOffered() []Tool {
+	return []Tool{
+		agentRegistry["bash"], agentRegistry["read_file"], agentRegistry["search"],
+		agentRegistry["write_file"], agentRegistry["use_skill"],
+	}
+}
+
+// alwaysApproved remembers "a" answers for the lifetime of the process.
+var alwaysApproved = map[string]bool{}
+
+// Agent tunables; defaults here, overridable via config.json "agent" section
+// (frza config set agent.max_rounds 30). See design §3.7.
+var (
+	agentMaxRounds     = 15
+	agentBashTimeout   = 120 * time.Second // default; model may request more via timeout_sec (cap 600s)
+	toolOutputMaxKB    = 8
+	contextMaxTokens   = 256000
+	backupKeepSessions = 10
+)
+
+// applyAgentConfig applies the config.json "agent" section onto the tunables.
+func applyAgentConfig(cfg map[string]interface{}) {
+	m := cfgMap(cfg, "agent")
+	if m == nil {
+		return
+	}
+	num := func(key string, dst *int) {
+		if v, ok := m[key].(float64); ok && v > 0 {
+			*dst = int(v)
+		}
+	}
+	num("max_rounds", &agentMaxRounds)
+	num("tool_output_max_kb", &toolOutputMaxKB)
+	num("context_max_tokens", &contextMaxTokens)
+	num("backup_keep_sessions", &backupKeepSessions)
+	if v, ok := m["bash_timeout_sec"].(float64); ok && v > 0 {
+		agentBashTimeout = time.Duration(int(v)) * time.Second
+	}
+}
+
+// describeCall renders a one-line summary of a tool call for the terminal.
+func describeCall(tc ToolCall) string {
+	var args struct {
+		Command string `json:"command"`
+		Path    string `json:"path"`
+		Pattern string `json:"pattern"`
+	}
+	if json.Unmarshal([]byte(tc.Arguments), &args) == nil {
+		switch {
+		case args.Command != "":
+			return truncateStr(args.Command, 200)
+		case args.Pattern != "" && args.Path != "":
+			return truncateStr(fmt.Sprintf("%q in %s", args.Pattern, args.Path), 200)
+		case args.Path != "":
+			return truncateStr(args.Path, 200)
+		}
+	}
+	return truncateStr(tc.Arguments, 200)
+}
+
+// sendMessage sends one user message to the model and renders the reply. In
+// agent mode it runs the tool-calling loop: model -> tool calls -> results ->
+// model, until a plain answer or the round cap. On failure/interruption of the
+// FIRST round the user message is dropped (legacy behavior); later rounds keep
+// history (tool results already recorded are valuable context).
+func sendMessage(session *Session, userInput, provider, apiKey string, ask confirmFunc) {
+	session.Messages = append(session.Messages, Message{Role: "user", Content: userInput})
+	isStreaming := streamingProviders[provider]
+
+	// Ctrl-C cancels the in-flight HTTP call or tool execution
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	var interrupted atomic.Bool
+	go func() {
+		select {
+		case <-sigCh:
+			interrupted.Store(true)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	agent := agentMode && toolProviders[provider]
+	var tools []Tool
+	systemPrompt := session.SystemPrompt
+	if agent {
+		tools = agentToolsOffered()
+		systemPrompt = composeAgentSystem(session.SystemPrompt)
+	}
+
+	callRound := func() (CallResult, error) {
+		indicator := newThinkingIndicator()
+		indicator.start()
+		var res CallResult
+		var err error
+		if isStreaming {
+			fmt.Println()
+			stream := newStreamRenderer()
+			onDelta := func(text string) {
+				indicator.stop()
+				stream.feed(text)
+			}
+			onReasoning := func(string) { indicator.randomVerb() }
+			res, err = callModel(ctx, provider, session.Messages, systemPrompt,
+				session.Model, apiKey, session.BaseURL, tools, onDelta, onReasoning)
+			indicator.stop()
+			stream.finish()
+			fmt.Println()
+		} else {
+			res, err = callModel(ctx, provider, session.Messages, systemPrompt,
+				session.Model, apiKey, session.BaseURL, tools, nil, nil)
+			indicator.stop()
+		}
+		return res, err
+	}
+
+	for round := 0; ; round++ {
+		// Keep the context within budget before each API round (§3.8):
+		// compress old tool outputs first, drop oldest turn groups if needed
+		if trimmed, dropped := trimContext(session.Messages, contextMaxTokens); dropped > 0 {
+			session.Messages = trimmed
+			fmt.Println(stylize(fmt.Sprintf("[context] omitted %d oldest rounds to fit the %d-token budget", dropped, contextMaxTokens), "yellow"))
+		} else {
+			session.Messages = trimmed
+		}
+		res, err := callRound()
+
+		if interrupted.Load() || err == errInterrupted {
+			fmt.Println(stylize("\n[cancelled] request interrupted", "gray"))
+			if round == 0 {
+				session.Messages = session.Messages[:len(session.Messages)-1]
+			}
+			return
+		}
+		if err != nil {
+			fmt.Println(stylize(fmt.Sprintf("\n[error] %v", err), "red"))
+			if round == 0 {
+				session.Messages = session.Messages[:len(session.Messages)-1] // failed message is not recorded
+			}
+			return
+		}
+
+		// Record the assistant turn (text and/or tool requests)
+		session.Messages = append(session.Messages, Message{Role: "assistant", Content: res.Text, ToolCalls: res.ToolCalls})
+		if !isStreaming && res.Text != "" {
+			fmt.Println()
+			fmt.Println(renderMarkdown(res.Text))
+			fmt.Println()
+		}
+
+		if len(res.ToolCalls) == 0 || !agent {
+			break // plain final answer
+		}
+
+		// Execute tool calls sequentially (design §3.7: ordered, dependencies)
+		for _, tc := range res.ToolCalls {
+			tool, known := agentRegistry[tc.Name]
+			if !known {
+				session.Messages = append(session.Messages, Message{
+					Role: "tool", ToolCallID: tc.ID, Name: tc.Name,
+					Content: fmt.Sprintf("[error] unknown tool %q", tc.Name),
+				})
+				continue
+			}
+			summary := describeCall(tc)
+			fmt.Println(stylize(fmt.Sprintf("⚙ %s: %s", tc.Name, summary), "cyan"))
+
+			// ---- confirmation gate (§3.6) ----
+			risk := riskUnknown
+			confirmMode := "auto"
+			approved := true
+			if tool.Confirm {
+				if tc.Name == "bash" || tc.Name == "exec" {
+					risk = classifyCommand(summary)
+				}
+				switch {
+				case risk == riskReadonly:
+					fmt.Println(stylize("  [auto] read-only command", "gray"))
+				case alwaysApproved[tc.Name]:
+					confirmMode = "always"
+					fmt.Println(stylize("  [auto] pre-approved this session", "gray"))
+				default:
+					if risk == riskDangerous {
+						fmt.Println(stylize("  ⚠ DESTRUCTIVE / NOT auto-reversible — no automatic undo possible", "red"))
+					}
+					ans := "y"
+					if ask != nil {
+						ans = ask(fmt.Sprintf("  execute? [y]es/[n]o/[a]lways: "))
+					}
+					confirmMode = ans
+					if ans == "a" {
+						alwaysApproved[tc.Name] = true
+					} else if ans != "y" {
+						approved = false
+					}
+				}
+			}
+
+			var result string
+			if !approved {
+				result = "[declined by user] the user refused to run this command; do NOT retry the same command, ask or propose an alternative"
+				fmt.Println(stylize("  declined", "gray"))
+				journalWrite(journalEntry{
+					Time: time.Now().Format("2006-01-02T15:04:05"), Session: session.Name,
+					Source: "model", Tool: tc.Name, Args: summary, Confirm: confirmMode,
+					Risk: riskName(risk), Result: "declined by user",
+				})
+			} else {
+				// Destructive op approved: back up identifiable targets first (§3.6)
+				var backups []string
+				var writeNewPath string // write_file creating a new file (undo = delete)
+				switch {
+				case risk == riskDangerous && (tc.Name == "bash" || tc.Name == "exec"):
+					for _, target := range backupTargetsFor(summary) {
+						if dst := backupFile(session.Name, target); dst != "" {
+							backups = append(backups, target+" -> "+dst)
+							fmt.Println(stylize(fmt.Sprintf("  [backup] %s -> %s", target, dst), "gray"))
+						}
+					}
+				case tc.Name == "write_file":
+					// Overwriting: back up the original; creating: undo = delete
+					var wargs struct {
+						Path string `json:"path"`
+					}
+					if json.Unmarshal([]byte(tc.Arguments), &wargs) == nil && wargs.Path != "" {
+						if _, err := os.Stat(wargs.Path); err == nil {
+							if dst := backupFile(session.Name, wargs.Path); dst != "" {
+								backups = append(backups, wargs.Path+" -> "+dst)
+								fmt.Println(stylize(fmt.Sprintf("  [backup] %s -> %s", wargs.Path, dst), "gray"))
+							}
+						} else {
+							writeNewPath = wargs.Path
+						}
+					}
+				}
+				tStart := time.Now()
+				out, rerr := tool.Run(ctx, tc.Arguments)
+				if rerr != nil {
+					out = "[error] " + rerr.Error()
+				}
+				if interrupted.Load() {
+					result = out + "\n[interrupted by user]"
+				} else {
+					result = out
+				}
+				fmt.Println(stylize(fmt.Sprintf("  → %s", truncateStr(firstLine(result), 160)), "gray"))
+				je := journalEntry{
+					Time: tStart.Format("2006-01-02T15:04:05"), Session: session.Name,
+					Source: "model", Tool: tc.Name, Args: summary, Confirm: confirmMode,
+					Risk: riskName(risk), Result: truncateStr(result, 300),
+				}
+				if len(backups) > 0 {
+					// one backup record per file for undo replay; the command
+					// entry carries the first mapping for quick reading
+					first := backups[0]
+					if i := strings.Index(first, " -> "); i >= 0 {
+						je.BackupOf, je.BackupTo = first[:i], first[i+4:]
+					}
+				}
+				if writeNewPath != "" && rerr == nil && !strings.HasPrefix(out, "[error]") {
+					je.Created = writeNewPath
+				}
+				journalWrite(je)
+				for _, b := range backups {
+					if b == backups[0] {
+						continue // already recorded in je above
+					}
+					if i := strings.Index(b, " -> "); i >= 0 {
+						journalWrite(journalEntry{
+							Time: tStart.Format("2006-01-02T15:04:05"), Session: session.Name,
+							Source: "model", Tool: "backup", Args: tc.Name + ": " + summary,
+							BackupOf: b[:i], BackupTo: b[i+4:], Result: "backup",
+						})
+					}
+				}
+			}
+			session.Messages = append(session.Messages, Message{
+				Role: "tool", ToolCallID: tc.ID, Name: tc.Name, Content: result,
+			})
+		}
+		// Auto-save every round so an unexpected exit loses nothing
+		saveSession(session, false)
+
+		if interrupted.Load() {
+			fmt.Println(stylize("\n[cancelled] tool execution interrupted", "gray"))
+			return
+		}
+		if round+1 >= agentMaxRounds {
+			fmt.Println(stylize(fmt.Sprintf("\n[agent] round limit (%d) reached; type /continue or send any message to keep going", agentMaxRounds), "yellow"))
+			break
+		}
+	}
+	// Auto-save every round so an unexpected exit doesn't lose history
+	saveSession(session, false)
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func riskName(r commandRisk) string {
+	switch r {
+	case riskReadonly:
+		return "readonly"
+	case riskReversible:
+		return "reversible"
+	case riskDangerous:
+		return "dangerous"
+	}
+	return "unknown"
+}
+
+func repl(session *Session, apiKey string) {
+	provider := session.Provider
+	fmt.Printf("%s  session %q  provider=%s  model=%s\n", shortVersion(), session.Name, provider, session.Model)
+	if agentMode {
+		fmt.Print("agent mode ON — the model can run tools (read-only auto-runs, changes ask first).\n")
+	}
+	fmt.Print("Type /help for commands, /exit to save and quit.\n\n")
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "> ",
+		AutoComplete:    frzCompleter{},
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+	})
+	if err != nil {
+		fmt.Println(stylize("[error] cannot initialize line editing: "+err.Error(), "red"))
+		return
+	}
+	defer rl.Close()
+
+	// ask is the confirmation gate for tool execution (y/n/a)
+	ask := func(prompt string) string {
+		rl.SetPrompt(prompt)
+		line, err := rl.Readline()
+		rl.SetPrompt("> ")
+		if err != nil {
+			fmt.Println()
+			return "n"
+		}
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "y", "yes":
+			return "y"
+		case "a", "always":
+			return "a"
+		}
+		return "n"
+	}
+
+	for {
+		userInput, err := rl.Readline()
+		if err != nil { // Ctrl-C (ErrInterrupt) or Ctrl-D (io.EOF): save and quit
+			fmt.Print("\n(interrupted, saving session...)\n")
+			saveSession(session, false)
+			break
+		}
+		userInput = strings.TrimSpace(userInput)
+		if userInput == "" {
+			continue
+		}
+
+		// `!cmd` runs a shell command directly (display only);
+		// `!!cmd` also feeds the output to the model (design §3.1)
+		if strings.HasPrefix(userInput, "!") {
+			feed := strings.HasPrefix(userInput, "!!")
+			cmdline := strings.TrimSpace(strings.TrimLeft(userInput, "!"))
+			if cmdline == "" {
+				continue
+			}
+			fmt.Println(stylize("$ "+cmdline, "cyan"))
+			argsJSON, _ := json.Marshal(map[string]string{"command": cmdline})
+			out, rerr := runBash(context.Background(), string(argsJSON))
+			if rerr != nil {
+				out = "[error] " + rerr.Error()
+			}
+			fmt.Println(out)
+			journalWrite(journalEntry{
+				Time: time.Now().Format("2006-01-02T15:04:05"), Session: session.Name,
+				Source: "user", Tool: "bash", Args: cmdline, Confirm: "user-direct",
+				Risk: riskName(classifyCommand(cmdline)), Result: truncateStr(out, 300),
+			})
+			if feed {
+				sendMessage(session, fmt.Sprintf("$ %s\n%s", cmdline, out), provider, apiKey, ask)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(userInput, "/") {
+			cmd := userInput
+			arg := ""
+			if i := strings.IndexAny(userInput, " \t"); i >= 0 {
+				cmd, arg = userInput[:i], strings.TrimSpace(userInput[i+1:])
+			}
+			cmd = strings.ToLower(cmd)
+
+			switch cmd {
+			case "/exit", "/quit":
+				if path, ok := saveSession(session, false); ok {
+					fmt.Printf("session saved to %s\n", path)
+				} else {
+					fmt.Println("(empty session, not saved)")
+				}
+				return
+
+			case "/help":
+				fmt.Print(helpText)
+
+			case "/save":
+				if arg != "" && arg != session.Name {
+					if _, err := os.Stat(sessionPath(arg)); err == nil {
+						fmt.Printf("session %q already exists, pick another name (to avoid overwriting it)\n", arg)
+						continue
+					}
+				}
+				if arg != "" {
+					session.Name = arg
+				}
+				path, _ := saveSession(session, true)
+				fmt.Printf("saved to %s\n", path)
+
+			case "/rename":
+				if arg == "" {
+					fmt.Println("usage: /rename <new-name>")
+					continue
+				}
+				oldName := session.Name
+				saveSession(session, false) // persist latest content first, then rename as a whole
+				if ok, result := renameSessionFile(oldName, arg); ok {
+					session.Name = arg
+					fmt.Printf("renamed session %q to %q\n", oldName, arg)
+				} else {
+					fmt.Println(result)
+				}
+
+			case "/resume":
+				target := arg
+				if target == "" {
+					// No name given: resume the most recently updated session
+					// (excluding the current one)
+					for _, e := range listSessions() {
+						if e.name != session.Name {
+							target = e.name
+							break
+						}
+					}
+					if target == "" {
+						fmt.Println("no session to resume.")
+						continue
+					}
+				}
+				saveSession(session, false)
+				loaded := loadSession(target)
+				if loaded == nil {
+					fmt.Printf("session %q not found; type /list to see saved sessions.\n", target)
+					continue
+				}
+				session = loaded
+				provider = session.Provider
+				// The resumed session may belong to another provider; re-resolve
+				// the key against the session's own provider to avoid a 401
+				if resumedKey := resolveAPIKey(provider, "", loadConfig()); resumedKey != "" {
+					apiKey = resumedKey
+				} else {
+					envName := envKeyNames[provider]
+					if envName == "" {
+						envName = "corresponding env var"
+					}
+					fmt.Println(stylize(fmt.Sprintf("[note] no API key found for %s (%s); calls in this session will fail", provider, envName), "red"))
+				}
+				fmt.Printf("switched to session %q provider=%s model=%s\n", session.Name, provider, session.Model)
+
+			case "/list":
+				sessions := listSessions()
+				if len(sessions) == 0 {
+					fmt.Println("(no saved sessions yet)")
+				}
+				for _, e := range sessions {
+					fmt.Printf("  - %s  [%s/%s]  %d messages  updated %s\n",
+						e.name, e.sess.Provider, e.sess.Model, len(e.sess.Messages), e.sess.UpdatedAt)
+				}
+
+			case "/new":
+				saveSession(session, false)
+				newName := arg
+				if newName == "" {
+					newName = defaultSessionName()
+				}
+				// Carry base_url over: openai_responses and similar providers
+				// cannot make calls without it
+				session = newSession(newName, provider, session.Model, session.SystemPrompt, session.BaseURL)
+				fmt.Printf("started new session %q\n", newName)
+
+			case "/export":
+				if len(session.Messages) == 0 {
+					fmt.Println("(no conversation yet, nothing to export)")
+					continue
+				}
+				path, overwritten := exportSession(session, arg)
+				msg := fmt.Sprintf("exported to %s", path)
+				if overwritten {
+					msg += " (overwrote existing file)"
+				}
+				fmt.Println(msg)
+
+			case "/edit":
+				text := editInEditor()
+				if text != "" {
+					if kb := len(text) / 1024; kb > 100 {
+						fmt.Printf("(editor content is %d KB, sending as a whole)\n", kb)
+					}
+					sendMessage(session, text, provider, apiKey, ask)
+				} else {
+					fmt.Println("(empty content, cancelled)")
+				}
+
+			case "/system":
+				if arg != "" {
+					session.SystemPrompt = arg
+					fmt.Println("system prompt updated.")
+				} else if session.SystemPrompt != "" {
+					fmt.Printf("current system prompt: %s\n", session.SystemPrompt)
+				} else {
+					fmt.Println("current system prompt: (not set)")
+				}
+
+			case "/model":
+				if arg != "" {
+					session.Model = arg
+					fmt.Printf("model switched to: %s\n", arg)
+				} else {
+					fmt.Printf("current model: %s\n", session.Model)
+				}
+
+			case "/baseurl":
+				if arg != "" {
+					session.BaseURL = arg
+					fmt.Printf("base url set to: %s\n", arg)
+				} else if session.BaseURL != "" {
+					fmt.Printf("current base url: %s\n", session.BaseURL)
+				} else {
+					fmt.Println("current base url: (not set, provider default)")
+				}
+
+			case "/history":
+				msgs := session.Messages
+				if len(msgs) == 0 {
+					fmt.Println("(no conversation yet in this session)")
+					continue
+				}
+				if arg != "" {
+					var n int
+					if _, err := fmt.Sscanf(arg, "%d", &n); err != nil || n <= 0 {
+						fmt.Println("usage: /history [last N rounds]")
+						continue
+					}
+					if 2*n < len(msgs) {
+						msgs = msgs[len(msgs)-2*n:]
+					}
+					// Align to a user-message boundary so display doesn't start mid-round
+					for len(msgs) > 0 && msgs[0].Role != "user" {
+						msgs = msgs[1:]
+					}
+					if len(msgs) < len(session.Messages) {
+						fmt.Printf("(showing last %d rounds only; full history has %d messages, /history shows all)\n",
+							n, len(session.Messages))
+					}
+				}
+				pageText(formatHistory(msgs))
+
+			case "/clear":
+				session.Messages = nil
+				fmt.Println("session history cleared.")
+
+			case "/agent":
+				switch strings.ToLower(arg) {
+				case "on":
+					agentMode = true
+				case "off":
+					agentMode = false
+				case "":
+				default:
+					fmt.Println("usage: /agent [on|off]")
+					continue
+				}
+				state := "off"
+				if agentMode {
+					state = "on"
+				}
+				note := ""
+				if agentMode && !toolProviders[session.Provider] {
+					note = " (warning: provider " + session.Provider + " has no tool support; chat-only)"
+				}
+				fmt.Printf("agent mode: %s%s\n", state, note)
+
+			case "/continue":
+				if len(session.Messages) == 0 {
+					fmt.Println("(nothing to continue)")
+					continue
+				}
+				sendMessage(session, "Please continue the investigation from where you stopped.", provider, apiKey, ask)
+
+			case "/skills":
+				skills := getSkills()
+				if len(skills) == 0 {
+					fmt.Println("(no skills found; drop skill dirs containing SKILL.md into ~/.frza/skills/)")
+					continue
+				}
+				fmt.Printf("%d skills:\n", len(skills))
+				for _, s := range skills {
+					fmt.Printf("  %-32s %s\n", s.Name, truncateStr(s.Description, 80))
+				}
+
+			case "/reload-skills":
+				skills := scanSkills()
+				fmt.Printf("reloaded: %d skills\n", len(skills))
+
+			case "/undo":
+				fmt.Println(undoLatest(session.Name))
+
+			case "/journal":
+				data, err := os.ReadFile(journalPath(session.Name))
+				if err != nil {
+					fmt.Println("(no journal entries for this session)")
+					continue
+				}
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				const maxShow = 20
+				start := 0
+				if len(lines) > maxShow {
+					start = len(lines) - maxShow
+					fmt.Printf("(showing last %d of %d entries; full log: %s)\n", maxShow, len(lines), journalPath(session.Name))
+				}
+				for _, ln := range lines[start:] {
+					var e journalEntry
+					if json.Unmarshal([]byte(ln), &e) != nil {
+						continue
+					}
+					mark := " "
+					if e.Risk == "dangerous" {
+						mark = stylize("!", "red")
+					}
+					fmt.Printf("%s %s [%s/%s] %s: %s\n", mark, e.Time[11:], e.Source, e.Confirm, e.Tool, truncateStr(e.Args, 100))
+				}
+
+			default:
+				fmt.Printf("unknown command: %s; type /help for available commands.\n", cmd)
+			}
+			continue
+		}
+
+		// Normal user message -> call the model
+		sendMessage(session, userInput, provider, apiKey, ask)
+	}
+}
+
+// --------------------------------------------------------------------------
+// CLI entry
+// --------------------------------------------------------------------------
+
+func resolveModel(provider, cliModel string, cfg map[string]interface{}) string {
+	if cliModel != "" {
+		return cliModel
+	}
+	if m := cfgMap(cfg, "models"); m != nil {
+		if s, ok := m[provider].(string); ok && s != "" {
+			return s
+		}
+	}
+	// The legacy global "model" config field only applies to the default
+	// provider in config — otherwise switching providers would call the API
+	// with the previous provider's model name (404)
+	if provider == cfgStr(cfg, "provider") {
+		if m := cfgStr(cfg, "model"); m != "" {
+			return m
+		}
+	}
+	return defaultModels[provider]
+}
+
+func resolveBaseURL(provider, cliURL string, cfg map[string]interface{}) string {
+	if cliURL != "" {
+		return cliURL
+	}
+	if urls := cfgMap(cfg, "base_urls"); urls != nil {
+		if s, ok := urls[provider].(string); ok && s != "" {
+			return s
+		}
+	}
+	return defaultBaseURLs[provider]
+}
+
+func resolveAPIKey(provider, cliKey string, cfg map[string]interface{}) string {
+	if cliKey != "" {
+		return cliKey
+	}
+	if envName := envKeyNames[provider]; envName != "" {
+		if k := os.Getenv(envName); k != "" {
+			return k
+		}
+	}
+	if keys := cfgMap(cfg, "api_keys"); keys != nil {
+		if s, ok := keys[provider].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+const helpUsage = `usage: frza [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]
+           [--base-url URL] [--system PROMPT] [--resume NAME]
+           [--session-name NAME] [--list-sessions] [--agent] [--version]
+           {config,rename,clean} ...
+
+options:
+  -h, --help           show this help message and exit
+  --provider PROVIDER  model backend: openai_responses / anthropic / openai / gemini (default openai_responses)
+  --model MODEL        model name, e.g. claude-sonnet-4-6 / gpt-4o / gemini-2.5-flash / kimi-k3
+  --api-key KEY        API key (can also come from env var or config, see below)
+  --base-url URL       custom API base url (required by openai_responses and similar providers)
+  --system PROMPT      system prompt
+  --resume NAME        resume the named session
+  --session-name NAME  name for the new session (auto-generated if omitted)
+  --list-sessions      list saved sessions and exit
+  --agent              start in agent mode (the main event): the model investigates
+                       with tools — bash/read_file/search/write_file/use_skill —
+                       and follows skill playbooks from ~/.frza/skills/.
+                       read-only commands auto-run, changes ask first (y/n/a),
+                       destructive ops warn and back up first; see /journal /undo
+  --version            show version info and exit
+
+subcommands:
+  config    view or set default config
+  rename    rename a saved session
+  clean     delete all empty sessions
+
+Examples:
+  frza --agent                               start the troubleshooting agent
+  frza --agent --resume my-session           resume an investigation
+  frza                                       plain chat with the default config
+  frza --provider openai --model gpt-4o      pick a provider / model
+  frza --list-sessions                       list all saved sessions and exit
+  frza config set --provider openai_responses --api-key xxx --base-url URL
+                                            persist defaults to ~/.frza/config.json
+  frza rename old new                        rename a saved session
+  frza clean                                 delete all empty sessions
+
+API key precedence: --api-key > environment variable > config file
+  anthropic=ANTHROPIC_API_KEY  openai=OPENAI_API_KEY
+  gemini=GEMINI_API_KEY        openai_responses=ARK_API_KEY
+
+Models and base urls are stored per provider and never leak across providers.
+
+Once inside a session, type /help for slash commands (/agent /skills /undo
+/journal /save /resume /export /edit /history etc.); !cmd runs a shell command
+directly, !!cmd also feeds its output to the model; Tab completes commands and
+/resume session names.
+`
+
+// parseFlags parses "--flag value", "--flag=value" and "--boolflag" forms
+func parseFlags(args []string, names map[string]bool, boolNames map[string]bool) (map[string]string, []string, error) {
+	flags := map[string]string{}
+	var rest []string
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if strings.HasPrefix(a, "--") {
+			kv := strings.SplitN(a[2:], "=", 2)
+			name := kv[0]
+			if boolNames[name] {
+				flags[name] = "true"
+				i++
+				continue
+			}
+			if !names[name] {
+				return nil, nil, fmt.Errorf("unknown option: --%s", name)
+			}
+			if len(kv) == 2 {
+				flags[name] = kv[1]
+			} else if i+1 < len(args) {
+				flags[name] = args[i+1]
+				i++
+			} else {
+				return nil, nil, fmt.Errorf("option --%s requires a value", name)
+			}
+		} else {
+			rest = append(rest, a)
+		}
+		i++
+	}
+	return flags, rest, nil
+}
+
+var mainFlagNames = map[string]bool{
+	"provider": true, "model": true, "api-key": true, "base-url": true,
+	"system": true, "resume": true, "session-name": true,
+}
+
+var mainBoolFlags = map[string]bool{"list-sessions": true, "version": true, "agent": true}
+
+// agentMode enables the tool-calling agent loop (--agent, /agent on|off).
+var agentMode bool
+
+// toolProviders: providers that support function calling (§1 provider policy).
+var toolProviders = map[string]bool{"openai_responses": true}
+
+func main() {
+	ensureDirs()
+	releaseEmbeddedSkills()
+	args := os.Args[1:]
+
+	// Subcommands
+	if len(args) > 0 {
+		switch args[0] {
+		case "config":
+			cmdConfig(args[1:])
+			return
+		case "rename":
+			cmdRename(args[1:])
+			return
+		case "clean":
+			cmdClean()
+			return
+		case "render": // hidden subcommand: render Markdown from stdin (for golden tests)
+			data, _ := io.ReadAll(os.Stdin)
+			fmt.Println(renderMarkdown(string(data)))
+			return
+		case "tooltest": // hidden subcommand: verify tool-calling against the live provider
+			cmdToolTest(args[1:])
+			return
+		}
+	}
+
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			fmt.Printf("%s — a terminal-native agentic troubleshooting agent\n", shortVersion())
+			fmt.Print("the model investigates with tools (bash/read_file/search/write_file),\n" +
+				"follows skill playbooks, and asks before changing anything (--agent).\n" +
+				"Plain multi-provider chat works too (Anthropic / OpenAI / Gemini / Responses).\n")
+			fmt.Printf("author: %s\n\n", author)
+			fmt.Print(helpUsage)
+			return
+		}
+	}
+
+	flags, _, err := parseFlags(args, mainFlagNames, mainBoolFlags)
+	if err != nil {
+		fmt.Println(err)
+		fmt.Print("usage: frza [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n" +
+			"           [--base-url URL] [--system PROMPT] [--resume NAME]\n" +
+			"           [--session-name NAME] [--list-sessions] [--agent] [--version]\n" +
+			"           {config,rename,clean} ...\n")
+		os.Exit(1)
+	}
+	if flags["version"] == "true" {
+		fmt.Println(versionString())
+		return
+	}
+	listOnly := flags["list-sessions"] == "true"
+	agentMode = flags["agent"] == "true"
+	cfg := loadConfig()
+	applyAgentConfig(cfg)
+
+	if listOnly {
+		sessions := listSessions()
+		if len(sessions) == 0 {
+			fmt.Println("(no saved sessions yet)")
+		}
+		for _, e := range sessions {
+			fmt.Printf("  - %s  [%s/%s]  %d messages  updated %s\n",
+				e.name, e.sess.Provider, e.sess.Model, len(e.sess.Messages), e.sess.UpdatedAt)
+		}
+		return
+	}
+
+	provider := flags["provider"]
+	if provider == "" {
+		provider = cfgStr(cfg, "provider")
+	}
+	if provider == "" {
+		provider = "openai_responses"
+	}
+	if _, ok := callers[provider]; !ok {
+		fmt.Printf("[error] unknown provider: %s (choose from: openai_responses / anthropic / openai / gemini)\n", provider)
+		os.Exit(1)
+	}
+
+	var session *Session
+	if name := flags["resume"]; name != "" {
+		session = loadSession(name)
+		if session == nil {
+			fmt.Printf("[error] session %q not found; see --list-sessions.\n", name)
+			os.Exit(1)
+		}
+		// The REPL always calls the model with the session's own provider, so the
+		// provider/key are re-resolved against it
+		provider = session.Provider
+	}
+
+	model := resolveModel(provider, flags["model"], cfg)
+	baseURL := resolveBaseURL(provider, flags["base-url"], cfg)
+	apiKey := resolveAPIKey(provider, flags["api-key"], cfg)
+
+	if apiKey == "" {
+		envName := envKeyNames[provider]
+		if envName == "" {
+			envName = "corresponding env var"
+		}
+		fmt.Printf("[error] no API key found for %s. Provide it via:\n", provider)
+		fmt.Println("  1) --api-key YOUR_KEY")
+		fmt.Printf("  2) export %s=YOUR_KEY\n", envName)
+		fmt.Printf("  3) frza config set --provider %s --api-key YOUR_KEY\n", provider)
+		os.Exit(1)
+	}
+
+	if _, need := defaultBaseURLs[provider]; need && baseURL == "" {
+		fmt.Printf("[error] provider=%s requires a base url; pass --base-url, "+
+			"or frza config set --provider %s --base-url URL\n", provider, provider)
+		os.Exit(1)
+	}
+
+	if session != nil {
+		// --resume: apply command-line overrides
+		if v := flags["system"]; v != "" {
+			session.SystemPrompt = v
+		}
+		if v := flags["model"]; v != "" {
+			session.Model = v
+		}
+		if v := flags["base-url"]; v != "" {
+			session.BaseURL = v
+		} else if session.BaseURL == "" {
+			session.BaseURL = baseURL
+		}
+	} else {
+		name := flags["session-name"]
+		if name == "" {
+			name = defaultSessionName()
+		}
+		session = newSession(name, provider, model, flags["system"], baseURL)
+	}
+
+	repl(session, apiKey)
+}
+
+func cmdConfig(args []string) {
+	cfg := loadConfig()
+	if len(args) == 0 || args[0] == "show" {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		enc.SetIndent("", "  ")
+		enc.Encode(cfg)
+		fmt.Print(buf.String())
+		return
+	}
+	if args[0] != "set" {
+		fmt.Println("usage: frza config {set,show} ...")
+		os.Exit(1)
+	}
+	for _, a := range args[1:] {
+		if a == "-h" || a == "--help" {
+			fmt.Print("usage: frza config set [-h] [--provider PROVIDER] [--model MODEL]\n" +
+				"                     [--api-key KEY] [--base-url URL]\n\n" +
+				"set default provider/model/api-key (API keys, base urls and models are stored per provider)\n")
+			return
+		}
+	}
+	flags, positional, err := parseFlags(args[1:], map[string]bool{
+		"provider": true, "model": true, "api-key": true, "base-url": true,
+	}, nil)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	// Positional form: frza config set agent.<key> <number> (design §3.7 knobs)
+	if len(positional) > 0 {
+		if len(positional) != 2 || !strings.HasPrefix(positional[0], "agent.") {
+			fmt.Println("usage: frza config set agent.{max_rounds|bash_timeout_sec|tool_output_max_kb|backup_keep_sessions|context_max_tokens} N")
+			os.Exit(1)
+		}
+		key := strings.TrimPrefix(positional[0], "agent.")
+		allowed := map[string]bool{"max_rounds": true, "bash_timeout_sec": true, "tool_output_max_kb": true, "backup_keep_sessions": true, "context_max_tokens": true}
+		if !allowed[key] {
+			fmt.Printf("[error] unknown agent config key %q\n", key)
+			os.Exit(1)
+		}
+		var num int
+		if _, err := fmt.Sscanf(positional[1], "%d", &num); err != nil || num <= 0 {
+			fmt.Printf("[error] value must be a positive integer: %q\n", positional[1])
+			os.Exit(1)
+		}
+		m := cfgMap(cfg, "agent")
+		if m == nil {
+			m = map[string]interface{}{}
+			cfg["agent"] = m
+		}
+		m[key] = num
+		saveConfig(cfg)
+		fmt.Printf("agent.%s = %d (takes effect on next start)\n", key, num)
+		return
+	}
+	defaultProvider := flags["provider"]
+	if defaultProvider == "" {
+		defaultProvider = cfgStr(cfg, "provider")
+	}
+	if defaultProvider == "" {
+		defaultProvider = "openai_responses"
+	}
+	if v := flags["provider"]; v != "" {
+		cfg["provider"] = v
+	}
+	if v := flags["model"]; v != "" {
+		m := cfgMap(cfg, "models")
+		if m == nil {
+			m = map[string]interface{}{}
+			cfg["models"] = m
+		}
+		m[defaultProvider] = v
+	}
+	if v := flags["api-key"]; v != "" {
+		m := cfgMap(cfg, "api_keys")
+		if m == nil {
+			m = map[string]interface{}{}
+			cfg["api_keys"] = m
+		}
+		m[defaultProvider] = v
+	}
+	if v := flags["base-url"]; v != "" {
+		m := cfgMap(cfg, "base_urls")
+		if m == nil {
+			m = map[string]interface{}{}
+			cfg["base_urls"] = m
+		}
+		m[defaultProvider] = v
+	}
+	saveConfig(cfg)
+	fmt.Printf("config saved to %s\n", configFile)
+}
+
+func cmdRename(args []string) {
+	if len(args) != 2 {
+		fmt.Println("usage: frza rename <old-name> <new-name>")
+		os.Exit(1)
+	}
+	if ok, result := renameSessionFile(args[0], args[1]); ok {
+		fmt.Printf("renamed session %q to %q (%s)\n", args[0], args[1], result)
+	} else {
+		fmt.Printf("[error] %s\n", result)
+		os.Exit(1)
+	}
+}
+
+func cmdClean() {
+	removed := []string{}
+	for _, e := range listSessions() {
+		if len(e.sess.Messages) == 0 {
+			os.Remove(sessionPath(e.name))
+			removed = append(removed, e.name)
+			fmt.Printf("deleted empty session: %s\n", e.name)
+		}
+	}
+	if len(removed) == 0 {
+		fmt.Println("(no empty sessions)")
+	}
+	// Prune old backup dirs, keeping the most recent backupKeepSessions (§3.6)
+	entries, err := os.ReadDir(backupDir)
+	if err == nil && len(entries) > backupKeepSessions {
+		type bd struct {
+			name string
+			mod  time.Time
+		}
+		var dirs []bd
+		for _, e := range entries {
+			if info, err := e.Info(); err == nil && e.IsDir() {
+				dirs = append(dirs, bd{e.Name(), info.ModTime()})
+			}
+		}
+		sort.Slice(dirs, func(i, j int) bool { return dirs[i].mod.After(dirs[j].mod) })
+		for _, d := range dirs[backupKeepSessions:] {
+			os.RemoveAll(filepath.Join(backupDir, d.name))
+			fmt.Printf("pruned old backups: %s\n", d.name)
+		}
+	}
+}
+
+// cmdToolTest is a hidden developer subcommand: it offers a fake "bash" tool to
+// the live provider and prints the parsed tool calls, then feeds a canned
+// result back to verify the function_call_output round-trip. Usage:
+//
+//	frza tooltest [--provider openai_responses] [--model M] [--base-url URL]
+func cmdToolTest(args []string) {
+	flags, _, err := parseFlags(args, mainFlagNames, mainBoolFlags)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	cfg := loadConfig()
+	provider := flags["provider"]
+	if provider == "" {
+		provider = cfgStr(cfg, "provider")
+	}
+	if provider == "" {
+		provider = "openai_responses"
+	}
+	model := resolveModel(provider, flags["model"], cfg)
+	baseURL := resolveBaseURL(provider, flags["base-url"], cfg)
+	apiKey := resolveAPIKey(provider, flags["api-key"], cfg)
+	if apiKey == "" {
+		fmt.Println("no API key; run: frza config set --provider " + provider + " --api-key YOUR_KEY")
+		return
+	}
+	fmt.Printf("provider=%s model=%s base=%s\n", provider, model, baseURL)
+
+	bashTool := Tool{
+		Name:        "bash",
+		Description: "Run a shell command",
+		Schema: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{"command": map[string]interface{}{"type": "string", "description": "the shell command to run"}},
+			"required":   []string{"command"},
+		},
+	}
+	msgs := []Message{{Role: "user", Content: "What is the disk usage of / on this machine? Use the bash tool to find out."}}
+
+	ctx := context.Background()
+	res, err := callModel(ctx, provider, msgs, "", model, apiKey, baseURL, []Tool{bashTool}, nil, nil)
+	if err != nil {
+		fmt.Println("[round1 error]", err)
+		return
+	}
+	fmt.Printf("[round1] text=%q tool_calls=%d\n", truncateStr(res.Text, 80), len(res.ToolCalls))
+	for _, tc := range res.ToolCalls {
+		fmt.Printf("  call id=%q name=%q args=%s\n", tc.ID, tc.Name, tc.Arguments)
+	}
+	if len(res.ToolCalls) == 0 {
+		fmt.Println("FAIL: model did not request a tool call")
+		return
+	}
+
+	// Round 2: replay the call + a canned result, expect a final text answer
+	msgs = append(msgs,
+		Message{Role: "assistant", ToolCalls: res.ToolCalls},
+		Message{Role: "tool", ToolCallID: res.ToolCalls[0].ID, Name: res.ToolCalls[0].Name,
+			Content: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/disk3s1   460G  380G   60G  87% /"},
+	)
+	res2, err := callModel(ctx, provider, msgs, "", model, apiKey, baseURL, []Tool{bashTool}, nil, nil)
+	if err != nil {
+		fmt.Println("[round2 error]", err)
+		return
+	}
+	fmt.Printf("[round2] text=%q tool_calls=%d\n", truncateStr(res2.Text, 200), len(res2.ToolCalls))
+	if res2.Text == "" {
+		fmt.Println("FAIL: no final answer after tool result")
+		return
+	}
+	fmt.Println("PASS: tool-calling round-trip works")
+}
+
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}

@@ -1,0 +1,102 @@
+event: response.created
+data: {"type":"response.created","response":{"created_at":1788920566,"id":"resp_021788920564019de824baea9702e17bffa39e9c3bdc4f635a484","max_output_tokens":32768,"model":"kimi-k3","object":"response","service_tier":"default","tools":[{"name":"bash","type":"function","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string","description":"the shell command to run"}},"required":["command"]}}],"caching":{"type":"disabled"},"store":false},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"created_at":1788920566,"id":"resp_021788920564019de824baea9702e17bffa39e9c3bdc4f635a484","max_output_tokens":32768,"model":"kimi-k3","object":"response","service_tier":"default","tools":[{"name":"bash","type":"function","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string","description":"the shell command to run"}},"required":["command"]}}],"caching":{"type":"disabled"},"store":false},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_02178892056620300000000000000000000ffffac150fb855421c","type":"reasoning","status":"in_progress"},"sequence_number":2}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"summary_index":0,"part":{"type":"summary_text"},"sequence_number":3}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"The","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":4}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" user","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":5}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" wants","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":6}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" to","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":7}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" know","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":8}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" the","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":9}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" disk","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":10}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" usage","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":11}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" of","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":12}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" /","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":13}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" on","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":14}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" this","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":15}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" machine","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":16}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":".","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":17}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" I'll","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":18}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" use","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":19}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" the","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":20}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" df","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":21}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":" command","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":22}
+
+data: {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":".","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"sequence_number":23}
+
+event: response.reasoning_summary_text.done
+data: {"type":"response.reasoning_summary_text.done","summary_index":0,"item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"text":"The user wants to know the disk usage of / on this machine. I'll use the df command.","sequence_number":24}
+
+event: response.reasoning_summary_part.done
+data: {"type":"response.reasoning_summary_part.done","item_id":"rs_02178892056620300000000000000000000ffffac150fb855421c","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"The user wants to know the disk usage of / on this machine. I'll use the df command."},"sequence_number":25}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_02178892056620300000000000000000000ffffac150fb855421c","type":"reasoning","summary":[{"type":"summary_text","text":"The user wants to know the disk usage of / on this machine. I'll use the df command."}],"status":"completed"},"sequence_number":26}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"call_id":"bash_0","name":"bash","type":"function_call","id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","status":"in_progress"},"sequence_number":27}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":28}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{\"command\":\"","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":29}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"df","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":30}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":" -","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":31}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"h","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":32}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":" /","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":33}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\"","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":34}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"}","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"sequence_number":35}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","output_index":1,"arguments":"{\"command\":\"df -h /\"}","sequence_number":36}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"arguments":"{\"command\":\"df -h /\"}","call_id":"bash_0","name":"bash","type":"function_call","id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","status":"completed"},"sequence_number":37}
+
+event: response.completed
+data: {"type":"response.completed","response":{"created_at":1788920566,"id":"resp_021788920564019de824baea9702e17bffa39e9c3bdc4f635a484","max_output_tokens":32768,"model":"kimi-k3","object":"response","output":[{"id":"rs_02178892056620300000000000000000000ffffac150fb855421c","type":"reasoning","summary":[{"type":"summary_text","text":"The user wants to know the disk usage of / on this machine. I'll use the df command."}],"status":"completed"},{"arguments":"{\"command\":\"df -h /\"}","call_id":"bash_0","name":"bash","type":"function_call","id":"fc_02178892056729100000000000000000000ffffac150fb8ab7b25","status":"completed"}],"service_tier":"default","status":"completed","tools":[{"name":"bash","type":"function","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string","description":"the shell command to run"}},"required":["command"]}}],"usage":{"input_tokens":187,"output_tokens":74,"total_tokens":261,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":21}},"caching":{"type":"disabled"},"store":false},"sequence_number":38}
+
+data: [DONE]
+

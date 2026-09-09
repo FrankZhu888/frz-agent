@@ -1,0 +1,178 @@
+package main
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestClassifyCommand(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want commandRisk
+	}{
+		// read-only singles
+		{"df -h", riskReadonly},
+		{"ls -la /var/log", riskReadonly},
+		{"cat /etc/hosts", riskReadonly},
+		{"dmesg | tail -100", riskReadonly},
+		{"ps aux | grep java", riskReadonly},
+		{"kubectl get pods -n kube-system", riskReadonly},
+		{"git status", riskReadonly},
+		{"tar -tf bundle.tar.gz", riskReadonly},
+		{"systemctl status nginx", riskReadonly},
+		// harmless discard idioms must NOT escalate (regression: 2>/dev/null
+		// used to match the overwrite-redirect dangerous pattern)
+		{"du -sh . 2>/dev/null", riskReadonly},
+		{"pwd && echo --- && du -sh . 2>/dev/null", riskReadonly},
+		{"grep -r ERROR /var/log 2>/dev/null | head -50", riskReadonly},
+		{"find / -name core 2>&1 | head", riskReadonly},
+		{"du -h --max-depth=1 . 2>/dev/null | sort -hr | head -20", riskReadonly},
+		// chain bypass attempts: worst segment wins
+		{"ls; rm -rf /tmp/x", riskDangerous},
+		{"cat /etc/hosts && rm a.log", riskDangerous},
+		{"ls | tee out.txt", riskReversible}, // tee not whitelisted -> confirm
+		{"echo hi > /tmp/x.txt", riskDangerous},
+		{"cat a > b.conf", riskDangerous},
+		// destructive
+		{"rm -rf /var/log/old", riskDangerous},
+		{"dd if=/dev/zero of=/dev/sda", riskDangerous},
+		{"systemctl restart nginx", riskDangerous},
+		{"kubectl delete pod foo", riskDangerous},
+		{"kill -9 1234", riskDangerous},
+		{"reboot", riskDangerous},
+		{"chmod -R 777 /data", riskDangerous},
+		// command substitution cannot be statically graded
+		{"echo $(rm -rf x)", riskUnknown},
+		{"ls `pwd`", riskUnknown},
+		// ordinary changes
+		{"mkdir /tmp/newdir", riskReversible},
+		{"touch /tmp/a", riskReversible},
+		{"python3 script.py", riskReversible},
+	}
+	for _, c := range cases {
+		if got := classifyCommand(c.cmd); got != c.want {
+			t.Errorf("classifyCommand(%q) = %v, want %v", c.cmd, got, c.want)
+		}
+	}
+}
+
+func TestSplitChain(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want []string
+	}{
+		{"ls -la", []string{"ls -la"}},
+		{"ls; rm x", []string{"ls", "rm x"}},
+		{"a && b || c", []string{"a", "b", "c"}},
+		{"grep 'a;b' file | wc -l", []string{"grep 'a;b' file", "wc -l"}},
+		{`echo "x|y" && ls`, []string{`echo "x|y"`, "ls"}},
+		{"  df -h  ", []string{"df -h"}},
+	}
+	for _, c := range cases {
+		got := splitChain(c.cmd)
+		if len(got) != len(c.want) {
+			t.Errorf("splitChain(%q) = %v, want %v", c.cmd, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("splitChain(%q)[%d] = %q, want %q", c.cmd, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+func TestTruncateToolOutput(t *testing.T) {
+	var lines []string
+	for i := 0; i < 1000; i++ {
+		lines = append(lines, "line")
+	}
+	big := strings.Join(lines, "\n")
+	out := truncateToolOutput(big, 10, 5, 8192)
+	if !strings.Contains(out, "985 of 1000 lines omitted") {
+		t.Errorf("truncation marker missing: %q", out)
+	}
+	if strings.Count(out, "\n") > 20 {
+		t.Errorf("too many lines kept: %d", strings.Count(out, "\n"))
+	}
+	// byte cap
+	long := strings.Repeat("x", 20000)
+	out = truncateToolOutput(long, 200, 50, 8192)
+	if len(out) > 8300 {
+		t.Errorf("byte cap not enforced: %d", len(out))
+	}
+}
+
+func TestRedactSecrets(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"mysql -u root -pSecret123 db", "mysql -u root -p*** db"},
+		{"export AWS_SECRET_KEY=abcd1234", "export AWS_SECRET_KEY=***"},
+		{"curl -H 'Authorization: Bearer tok123' x", "curl -H 'Authorization: ***' x"},
+		{"token=xyz789", "token=***"},
+		{"ls -la", "ls -la"},
+	}
+	for _, c := range cases {
+		got := redactSecrets(c.in)
+		if !strings.Contains(got, "***") && strings.Contains(c.want, "***") {
+			t.Errorf("redactSecrets(%q) = %q, want something like %q", c.in, got, c.want)
+		}
+		if strings.Contains(got, "Secret123") || strings.Contains(got, "abcd1234") || strings.Contains(got, "tok123") || strings.Contains(got, "xyz789") {
+			t.Errorf("secret leaked in redactSecrets(%q) = %q", c.in, got)
+		}
+	}
+}
+
+func TestBackupTargetsFor(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want []string
+	}{
+		{"rm a.log", []string{"a.log"}},
+		{"rm -rf /tmp/x /tmp/y", []string{"/tmp/x", "/tmp/y"}},
+		{"ls; rm -f b.txt", []string{"b.txt"}},
+		{"echo hi > c.txt", []string{"c.txt"}},
+		{"cat a >> d.log", []string{"d.log"}},
+		{"df -h", nil},
+		{"du -sh . 2>/dev/null", nil},
+	}
+	for _, c := range cases {
+		got := backupTargetsFor(c.cmd)
+		if len(got) != len(c.want) {
+			t.Errorf("backupTargetsFor(%q) = %v, want %v", c.cmd, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("backupTargetsFor(%q)[%d] = %q, want %q", c.cmd, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+func TestRunBashTimeout(t *testing.T) {
+	old := agentBashTimeout
+	agentBashTimeout = 120 * time.Second
+	t.Cleanup(func() { agentBashTimeout = old })
+
+	// model-requested timeout below the 5s floor is clamped to 5s
+	start := time.Now()
+	out, err := runBash(context.Background(), `{"command":"sleep 30","timeout_sec":1}`)
+	if err != nil {
+		t.Fatalf("runBash: %v", err)
+	}
+	if !strings.Contains(out, "timed out after 5s") {
+		t.Errorf("expected clamp-to-5s timeout, got %q", out)
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Errorf("5s floor not honored (took %s)", d)
+	}
+
+	// excessive values are capped (hard cap is 600s; don't actually sleep —
+	// just verify the clamp via a quick command)
+	out, err = runBash(context.Background(), `{"command":"echo ok","timeout_sec":99999}`)
+	if err != nil || !strings.Contains(out, "ok") {
+		t.Errorf("capped quick command failed: %q %v", out, err)
+	}
+}

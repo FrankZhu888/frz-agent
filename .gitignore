@@ -1,0 +1,6 @@
+.DS_Store
+go/frza
+go/frza-*
+go/checksums.txt
+go/frz-go
+go/dist/

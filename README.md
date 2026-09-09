@@ -139,6 +139,14 @@ go test ./...         # classifier / SSE replay / retry / context / undo suites
 `CGO_ENABLED=0` static builds: one file, no glibc dependency, runs anywhere
 with Linux kernel ≥ 3.2 or macOS 11+.
 
+## Deployment
+
+Two patterns: run in-place on the affected machine, or (recommended) on a
+dedicated analysis workstation that evidence is copied to — including driving a
+Windows WinDbg box over SSH for memory.dmp analysis. See
+[DEPLOYMENT.md](DEPLOYMENT.md) for the decision table, workstation dependency
+checklist, and the on-call runbook.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

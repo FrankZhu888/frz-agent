@@ -77,25 +77,49 @@ Optional, per your skills: `kubectl`, `perf`, `pcp`, `nvme-cli`, `smartmontools`
 ## Analyzing Windows dumps from a Linux workstation
 
 Windows `memory.dmp` / minidump analysis requires WinDbg (`cdb.exe`), which
-only exists on Windows. The proven pattern is a small Windows analysis box
-(VM is fine) with WinDbg and OpenSSH server installed, and let frza drive it
-over SSH:
+only exists on Windows. A proven pattern: run a small Windows analysis box
+(a VM is fine) with WinDbg and OpenSSH server installed, and let frza drive
+it over SSH from the Linux workstation:
 
 ```
 frza (Linux) --ssh-->  windows-dump-box: cdb -z memory.dmp -c "!analyze -v; q"
 ```
 
-- The `windows-dump-analyzer` skill is written for exactly this flow; point it
-  at your host via an environment variable, e.g. `export FRZA_WINDBG_HOST=windbg@10.x.y.z`
-- SSH commands are not in the read-only whitelist (frza cannot back up what
-  happens on a remote machine), so the agent will ask for confirmation —
-  answer `a` once per session to approve the channel, the journal still
-  records every remote command
-- Verify the channel non-interactively first:
-  `ssh -o BatchMode=yes $FRZA_WINDBG_HOST "cdb -version"`
+The analysis is read-only (cdb only reads the dump file), which is the
+comfort zone of the safety model. Two things to know:
 
-The analysis itself is read-only (cdb reads the dump file), which is the
-comfort zone of the safety model.
+- **SSH commands are not in the read-only whitelist** (frza cannot back up
+  what happens on a remote machine), so the agent asks for confirmation —
+  answer `a` once per session to approve the channel; the journal still
+  records every remote command.
+- **Verify the channel non-interactively** before handing it to the agent:
+  `ssh -o BatchMode=yes windbg@<windows-box> "cdb -version"`
+
+This flow is a good example of encoding your own topology as a skill (not
+included in the starter pack — it is specific to your environment). A minimal
+playbook looks like:
+
+```markdown
+---
+name: windows-dump-analyzer
+description: 分析 Windows memory.dmp/minidump 蓝屏转储，定位 BSOD 根因。
+             当用户提供 .dmp 文件或提到蓝屏分析时使用本技能。
+---
+
+## 前置检查
+- dump 文件已拷到本机
+- `ssh -o BatchMode=yes windbg@<your-windows-box> "cdb -version"` 通道可用
+
+## 流程
+1. 把 dump 推到分析机：`scp <file> windbg@<your-windows-box>:C:/dumps/`
+2. 自动分析：`ssh windbg@<your-windows-box> "cdb -z C:/dumps/<file> -c \"!analyze -v; q\""`
+3. 按输出中的 IMAGE_NAME / MODULE_NAME 分支深挖：
+   驱动问题加跑 `lm kv m <module>`，进程上下文加跑 `!process 0 0`
+4. 输出：根因（驱动/硬件/系统组件）、证据链、修复或规避建议
+```
+
+Ten lines of markdown and the agent can drive your whole WinDbg rig — that
+is the point of skills being portable playbooks rather than code.
 
 ## On-call runbook (incident-time usage)
 

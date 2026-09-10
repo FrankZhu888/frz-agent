@@ -732,10 +732,15 @@ func parseResponsesSSE(ctx context.Context, body io.Reader, onDelta, onReasoning
 			if ctx.Err() == context.Canceled {
 				return CallResult{}, errInterrupted
 			}
-			break
+			// Stream ended without response.completed (connection reset, TLS
+			// failure): returning partial output here would record a truncated
+			// answer — or execute a tool with truncated JSON arguments — as if
+			// the call had succeeded (review F4). Treat as an error instead.
+			return CallResult{}, fmt.Errorf("stream ended prematurely (before response.completed): %v", err)
 		}
 	}
-	return CallResult{Text: full.String(), ToolCalls: collectCalls()}, nil
+	// no return needed past the loop: every path out returns (response.completed,
+	// cancellation, or premature-end error)
 }
 
 // callerFunc is the uniform provider call. tools is the set offered to the
@@ -799,7 +804,9 @@ var readonlyCmds = map[string]bool{
 var readonlySubcmds = map[string][]string{
 	"systemctl": {"status", "list-units", "list-unit-files", "is-active", "is-enabled", "show", "cat", "--version"},
 	"kubectl":   {"get", "describe", "logs", "explain", "api-resources", "api-versions", "cluster-info", "top"},
-	"git":       {"status", "log", "diff", "show", "branch", "tag", "remote", "blame", "ls-files", "rev-parse"},
+	// branch/tag/remote deliberately excluded: their bare forms list, but
+	// `git branch -D`, `git tag -d`, `git remote remove` delete (review F3)
+	"git": {"status", "log", "diff", "show", "blame", "ls-files", "rev-parse"},
 	"tar":       {"-tf", "-tvf", "--list"},
 	"sysctl":    {"-a", "-n"},
 	"mount":     {""}, // bare `mount` only
@@ -2639,6 +2646,9 @@ func pageText(text string) {
 		pager = "less"
 	}
 	parts := strings.Fields(pager)
+	if len(parts) == 0 { // whitespace-only PAGER (review F5)
+		parts = []string{"less"}
+	}
 	if filepath.Base(parts[0]) == "less" {
 		parts = append(parts, "-R", "-F", "-X")
 	}
@@ -2830,6 +2840,19 @@ func applyAgentConfig(cfg map[string]interface{}) {
 	}
 }
 
+// bashCommandOf extracts the full, untruncated command from a bash/exec tool
+// call for SAFETY decisions (classification, backup extraction). Falls back to
+// the raw arguments when unparseable — never truncated.
+func bashCommandOf(tc ToolCall) string {
+	var args struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal([]byte(tc.Arguments), &args) == nil && args.Command != "" {
+		return args.Command
+	}
+	return tc.Arguments
+}
+
 // describeCall renders a one-line summary of a tool call for the terminal.
 func describeCall(tc ToolCall) string {
 	var args struct {
@@ -2964,12 +2987,16 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 			fmt.Println(stylize(fmt.Sprintf("⚙ %s: %s", tc.Name, summary), "cyan"))
 
 			// ---- confirmation gate (§3.6) ----
+			// Safety decisions (classification, backup extraction) MUST run on
+			// the full untruncated command; summary is display-only (review F1:
+			// a payload padded past describeCall's 200 chars would otherwise
+			// evade the dangerous-pattern scan entirely).
 			risk := riskUnknown
 			confirmMode := "auto"
 			approved := true
 			if tool.Confirm {
 				if tc.Name == "bash" || tc.Name == "exec" {
-					risk = classifyCommand(summary)
+					risk = classifyCommand(bashCommandOf(tc))
 				}
 				switch {
 				case risk == riskReadonly:
@@ -3009,7 +3036,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				var writeNewPath string // write_file creating a new file (undo = delete)
 				switch {
 				case risk == riskDangerous && (tc.Name == "bash" || tc.Name == "exec"):
-					for _, target := range backupTargetsFor(summary) {
+					for _, target := range backupTargetsFor(bashCommandOf(tc)) {
 						if dst := backupFile(session.Name, target); dst != "" {
 							backups = append(backups, target+" -> "+dst)
 							fmt.Println(stylize(fmt.Sprintf("  [backup] %s -> %s", target, dst), "gray"))
@@ -3866,7 +3893,7 @@ func cmdClean() {
 	}
 	// Prune old backup dirs, keeping the most recent backupKeepSessions (§3.6)
 	entries, err := os.ReadDir(backupDir)
-	if err == nil && len(entries) > backupKeepSessions {
+	if err == nil {
 		type bd struct {
 			name string
 			mod  time.Time
@@ -3877,10 +3904,14 @@ func cmdClean() {
 				dirs = append(dirs, bd{e.Name(), info.ModTime()})
 			}
 		}
-		sort.Slice(dirs, func(i, j int) bool { return dirs[i].mod.After(dirs[j].mod) })
-		for _, d := range dirs[backupKeepSessions:] {
-			os.RemoveAll(filepath.Join(backupDir, d.name))
-			fmt.Printf("pruned old backups: %s\n", d.name)
+		// guard on len(dirs), not len(entries): stray files/stat errors can
+		// shrink dirs below backupKeepSessions (review F6)
+		if len(dirs) > backupKeepSessions {
+			sort.Slice(dirs, func(i, j int) bool { return dirs[i].mod.After(dirs[j].mod) })
+			for _, d := range dirs[backupKeepSessions:] {
+				os.RemoveAll(filepath.Join(backupDir, d.name))
+				fmt.Printf("pruned old backups: %s\n", d.name)
+			}
 		}
 	}
 }

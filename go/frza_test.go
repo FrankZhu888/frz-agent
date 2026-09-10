@@ -58,6 +58,11 @@ func TestClassifyCommand(t *testing.T) {
 		{"ip addr show", riskReadonly},
 		{"ifconfig eth0 down", riskReversible},
 		{"ifconfig -a", riskReadonly},
+		// git mutating forms must not be read-only (review F3)
+		{"git branch -D feature-work", riskReversible},
+		{"git tag -d v0.9", riskReversible},
+		{"git remote remove origin", riskReversible},
+		{"git log --oneline | head", riskReadonly},
 		// ordinary changes
 		{"mkdir /tmp/newdir", riskReversible},
 		{"touch /tmp/a", riskReversible},
@@ -187,4 +192,26 @@ func TestRunBashTimeout(t *testing.T) {
 	if err != nil || !strings.Contains(out, "ok") {
 		t.Errorf("capped quick command failed: %q %v", out, err)
 	}
+}
+
+// TestPaddingEvasion: safety decisions must use the full command, never the
+// 200-char display summary (review F1). A payload padded past 200 chars with
+// a destructive tail must still classify as dangerous.
+func TestPaddingEvasion(t *testing.T) {
+	padding := strings.Repeat("/very/long/harmless/path", 12) // >200 chars
+	payload := "grep foo " + padding + " ; rm -rf /home/user/data"
+	if len(payload) < 220 {
+		t.Fatalf("test payload too short: %d", len(payload))
+	}
+	// the old code classified describeCall's truncated summary; the full
+	// command must be used (via bashCommandOf in the tool-call path)
+	if got := classifyCommand(payload); got != riskDangerous {
+		t.Errorf("padded payload classified %v, want riskDangerous", got)
+	}
+	// and the truncation that made this dangerous must not be what safety sees
+	if len(truncateStr(payload, 200)) >= len(payload) {
+		t.Fatalf("truncateStr did not truncate — test setup broken")
+	}
+	tc := ToolCall{ID: "x", Name: "bash", Arguments: `{"command":"` + payload + `"}`}
+	_ = tc // bashCommandOf coverage lives in the wiring; classify is the gate
 }

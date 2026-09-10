@@ -122,3 +122,18 @@ data: {"type":"response.completed"}
 		t.Errorf("unexpected tool calls: %+v", res.ToolCalls)
 	}
 }
+
+// TestParseResponsesSEPrematureEnd: a stream cut off before
+// response.completed must be an error, never a partial success (review F4).
+func TestParseResponsesSEPrematureEnd(t *testing.T) {
+	stream := `event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_A","type":"function_call","call_id":"bash_0","name":"bash"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_A","delta":"{\"command\":\"df"}
+`
+	_, err := parseResponsesSSE(context.Background(), strings.NewReader(stream), nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "prematurely") {
+		t.Errorf("expected premature-end error, got %v", err)
+	}
+}

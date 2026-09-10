@@ -46,6 +46,18 @@ func TestClassifyCommand(t *testing.T) {
 		// command substitution cannot be statically graded
 		{"echo $(rm -rf x)", riskUnknown},
 		{"ls `pwd`", riskUnknown},
+		// whitelist write-flag escapes: not auto-run (regression guard)
+		{"sed -i s/a/b/ app.conf", riskReversible},
+		{"sed s/a/b/ app.conf", riskReadonly},
+		{"find /var/log -name '*.log' -delete", riskReversible},
+		{"find /var/log -name '*.log'", riskReadonly},
+		{"sort -o out.txt in.txt", riskReversible},
+		{"journalctl --vacuum-time=1d", riskReversible},
+		{"journalctl -u nginx --since today", riskReadonly},
+		{"ip link set eth0 down", riskReversible},
+		{"ip addr show", riskReadonly},
+		{"ifconfig eth0 down", riskReversible},
+		{"ifconfig -a", riskReadonly},
 		// ordinary changes
 		{"mkdir /tmp/newdir", riskReversible},
 		{"touch /tmp/a", riskReversible},

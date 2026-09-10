@@ -887,6 +887,20 @@ func nthToken(seg string, n int) string {
 	return fields[n]
 }
 
+// writeFlags: flags that turn an otherwise read-only command into a writer.
+// A whitelisted command carrying any of these is NOT read-only — e.g.
+// `sed -i`, `find -delete`, `sort -o`, `journalctl --vacuum-*`.
+var writeFlags = map[string][]string{
+	"sed":        {"-i", "--in-place", "-i.bak"},
+	"find":       {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf"},
+	"sort":       {"-o", "--output"},
+	"awk":        {"-i", "--include"}, // gawk inplace extension is -i inplace
+	"journalctl": {"--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync", "--relinquish-var"},
+	"ip":         {"add", "del", "delete", "set", "change", "replace", "flush", "save", "restore"},
+	"ifconfig":   {"up", "down", "add", "delete"},
+	"xargs":      {"-I", "--replace"}, // -I makes arbitrary command construction trivial
+}
+
 // isReadonlySegment reports whether a single chain segment is a known
 // read-only invocation (whitelist + subcommand/flag checks).
 func isReadonlySegment(seg string) bool {
@@ -907,7 +921,20 @@ func isReadonlySegment(seg string) bool {
 		}
 		return false
 	}
-	return readonlyCmds[tok]
+	if !readonlyCmds[tok] {
+		return false
+	}
+	// whitelisted command, but a write-capable flag/subcommand revokes it
+	if bad, ok := writeFlags[tok]; ok {
+		for _, field := range strings.Fields(seg)[1:] {
+			for _, b := range bad {
+				if field == b || strings.HasPrefix(field, b+"=") {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // nullRedirect matches harmless output discards: 2>/dev/null, 2>&1, &>,
@@ -2809,6 +2836,7 @@ func describeCall(tc ToolCall) string {
 		Command string `json:"command"`
 		Path    string `json:"path"`
 		Pattern string `json:"pattern"`
+		Name    string `json:"name"`
 	}
 	if json.Unmarshal([]byte(tc.Arguments), &args) == nil {
 		switch {
@@ -2818,6 +2846,8 @@ func describeCall(tc ToolCall) string {
 			return truncateStr(fmt.Sprintf("%q in %s", args.Pattern, args.Path), 200)
 		case args.Path != "":
 			return truncateStr(args.Path, 200)
+		case args.Name != "":
+			return args.Name
 		}
 	}
 	return truncateStr(tc.Arguments, 200)

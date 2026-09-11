@@ -134,6 +134,10 @@ is the point of skills being portable playbooks rather than code.
 5. After mitigation: `/export` the session to Markdown as postmortem material;
    journal + session together are the evidence trail
 
+Terminal acting up over SSH (invisible text, wrong colors)? `frza colortest`
+shows a swatch of every color path; force `FRZA_THEME=dark|light` or switch
+colors off with `FRZA_THEME=none` / `NO_COLOR=1`.
+
 ## Network & data checklist
 
 | Requirement | Pattern A | Pattern B |

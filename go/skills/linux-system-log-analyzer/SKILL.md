@@ -58,16 +58,16 @@ description: Linux系统日志深度分析技能，支持全品类Linux系统日
 ## 🚀 快速使用
 ```bash
 # 基本分析（支持dmesg/syslog/messages/journalctl/控制台日志等所有系统日志类型）
-@计小牛 分析系统日志："/path/to/syslog.log"
+分析系统日志："/path/to/syslog.log"
 
 # 分析实时dmesg输出
-@计小牛 分析dmesg："dmesg输出内容"
+分析dmesg："dmesg输出内容"
 
 # 分析启动报错日志
-@计小牛 分析启动报错："grub rescue> 相关日志"
+分析启动报错："grub rescue> 相关日志"
 
 # 分析journalctl服务日志
-@计小牛 分析服务报错："journalctl -u sshd输出内容"
+分析服务报错："journalctl -u sshd输出内容"
 ```
 
 ## 📊 示例输出
@@ -99,8 +99,3 @@ description: Linux系统日志深度分析技能，支持全品类Linux系统日
 - 核心脚本：`scripts/analyzer.py` - 负责日志解析、错误提取、噪声过滤
 - 噪声规则：`config/noise_filters.yaml` - 可自定义需要过滤的日志规则
 - 错误模式：`config/error_patterns.yaml` - 可扩展支持更多错误类型识别
-
-**Skill Path**: `~/.openclaw/workspace/skills/linux-system-log-analyzer/`  
-**Maintainer**: SRE Team  
-**Version**: 1.0.0  
-**Last Updated**: 2026-03-17

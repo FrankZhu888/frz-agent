@@ -1787,7 +1787,12 @@ var useColor = detectColorSupport()
 
 var ansiCodes = map[string]string{
 	"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "italic": "\033[3m",
-	"red": "\033[31m", "green": "\033[32m", "gray": "\033[90m",
+	"red": "\033[31m", "green": "\033[32m",
+	// 256-color mid-gray: ANSI 90 (bright black) is near-invisible on many
+	// dark terminal themes, especially over SSH on Linux (user report
+	// 2026-09-11). 245 stays de-emphasized but readable on both dark and
+	// light backgrounds.
+	"gray": "\033[38;5;245m",
 	// Inline code: blue-violet rgb(177,185,249), Claude Code's suggestion color
 	"inline_code": "\033[38;2;177;185;249m",
 }

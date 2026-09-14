@@ -39,3 +39,16 @@ func TestDetectColorSupportThemeNone(t *testing.T) {
 	// cannot assert tty-dependent true case; just ensure no panic and bool type
 	_ = detectColorSupport()
 }
+
+func TestSupportsTrueColor(t *testing.T) {
+	cases := []struct{ env, want string }{
+		{"truecolor", "true"}, {"24bit", "true"}, {"TRUECOLOR", "true"},
+		{"", "false"}, {"yes", "false"}, {"256color", "false"},
+	}
+	for _, c := range cases {
+		t.Setenv("COLORTERM", c.env)
+		if got := supportsTrueColor(); got != (c.want == "true") {
+			t.Errorf("COLORTERM=%q: supportsTrueColor() = %v, want %s", c.env, got, c.want)
+		}
+	}
+}

@@ -1788,6 +1788,26 @@ func detectColorSupport() bool {
 
 var useColor = detectColorSupport()
 
+// supportsTrueColor reports whether the terminal can render 24-bit color.
+// Only COLORTERM=truecolor/24bit is trusted; when unset we assume NO — a
+// 256-color approximation looks nearly identical, but a raw RGB sequence on a
+// terminal that cannot parse it renders invisible (user report 2026-09-11).
+func supportsTrueColor() bool {
+	ct := strings.ToLower(os.Getenv("COLORTERM"))
+	return ct == "truecolor" || ct == "24bit"
+}
+
+var trueColor = supportsTrueColor()
+
+func init() {
+	if !trueColor {
+		// 256-color approximations of the truecolor accents
+		ansiCodes["inline_code"] = "\033[38;5;189m"
+		shimmerBase = "\033[38;5;153m"
+		shimmerHot = "\033[38;5;189m"
+	}
+}
+
 var ansiCodes = map[string]string{
 	"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "italic": "\033[3m",
 	"red": "\033[31m", "green": "\033[32m",
@@ -2107,10 +2127,13 @@ func highlightCode(code, lang string) string {
 		toks = lexFragment(lexer, code)
 	}
 	toks = demoteCompoundNumberTokens(toks)
-	// Truecolor formatter: emits the style's exact RGB values, more faithful to
-	// the theme than 256-color approximation (whose mapping differs between
-	// chroma and pygments anyway)
-	formatter := formatters.Get("terminal16m")
+	// terminal16m emits exact RGB (more faithful) but only when the terminal
+	// can render it; otherwise approximate to the 256-color palette
+	formatterName := "terminal256"
+	if trueColor {
+		formatterName = "terminal16m"
+	}
+	formatter := formatters.Get(formatterName)
 	var buf bytes.Buffer
 	if err := formatter.Format(&buf, styles.Get(pickStyle()), chroma.Literator(toks...)); err != nil {
 		return code
@@ -2527,10 +2550,13 @@ func (s *streamRenderer) emit(line string) {
 var thinkingVerbs = []string{"Thinking", "Pondering", "Mulling", "Brewing", "Wondering",
 	"Deliberating", "Computing", "Searching", "Weaving", "Wandering"}
 
-const (
+const shimmerW = 4
+
+// shimmer colors are vars: init() swaps in 256-color approximations when the
+// terminal lacks truecolor (see supportsTrueColor)
+var (
 	shimmerBase = "\033[38;2;147;165;255m" // claudeBlue_FOR_SYSTEM_SPINNER
 	shimmerHot  = "\033[38;2;177;195;255m" // claudeBlueShimmer
-	shimmerW    = 4
 )
 
 type thinkingIndicator struct {
@@ -4021,8 +4047,10 @@ func truncateStr(s string, n int) string {
 // which elements are illegible. It forces colors on (diagnosis is the point)
 // and prints the auto-detection verdicts alongside.
 func cmdColorTest() {
-	fmt.Printf("TERM=%q COLORFGBG=%q FRZA_THEME=%q\n", os.Getenv("TERM"), os.Getenv("COLORFGBG"), os.Getenv("FRZA_THEME"))
-	fmt.Printf("useColor(auto)=%v pickStyle=%s\n\n", useColor, pickStyle())
+	fmt.Printf("TERM=%q COLORFGBG=%q COLORTERM=%q FRZA_THEME=%q\n",
+		os.Getenv("TERM"), os.Getenv("COLORFGBG"), os.Getenv("COLORTERM"), os.Getenv("FRZA_THEME"))
+	fmt.Printf("useColor(auto)=%v pickStyle=%s trueColor=%v (accent codes: %s)\n\n",
+		useColor, pickStyle(), trueColor, map[bool]string{true: "24-bit RGB", false: "256-color"}[trueColor])
 
 	useColor = true // force on for the swatches
 	sample := "net.ipv4.conf.all.rp_filter = 0  # 反向路径过滤被完全关闭（应为 2，宽松模式）"

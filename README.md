@@ -28,6 +28,11 @@ frza --agent
 Three starter skill playbooks (Linux system logs, Kubernetes, general app logs)
 are embedded in the binary and released to `~/.frza/skills/` on first run.
 
+New sessions start with a small built-in system prompt (a troubleshooting
+copilot persona); `/system` shows it, `/system <prompt>` replaces it,
+`/system off` clears it. In agent mode your prompt is layered with frza's
+built-in operating rules and the skill catalog.
+
 ## What it looks like
 
 Analyzing a kubelet log for a node whose pods won't start:

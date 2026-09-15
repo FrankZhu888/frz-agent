@@ -1672,6 +1672,12 @@ func getSkills() []skillInfo {
 
 // agentSystemBlock is the built-in operating-rules layer of the agent system
 // prompt (design §3.7, layer 2 of 3).
+// defaultSystemPrompt is baked into newly created sessions when --system is
+// not given (chat mode's layer-1; agent mode appends its own blocks on top).
+// It lives in the session, not hidden in code: /system shows it, edits it,
+// and `/system off` clears it.
+const defaultSystemPrompt = `You are frza, a troubleshooting copilot for engineers running Linux and cloud infrastructure. Answer in the user's language. Be concrete: real commands, paths, and evidence over generic advice. Keep answers structured and tight.`
+
 const agentSystemBlock = `You are a troubleshooting agent running on the user's machine with tool access.
 
 Operating rules:
@@ -2741,7 +2747,8 @@ const helpText = `Available commands:
                          (default ~/.frza/exports/<session>.md)
 
   Session settings
-    /system [prompt]     View or set the system prompt
+    /system [prompt|off]  View, set, or clear the system prompt
+                         (new sessions start with a built-in troubleshooting default)
     /model [name]        View or switch model
     /baseurl [url]       View or set custom API base url (required by
                          openai_responses and similar providers)
@@ -3377,13 +3384,19 @@ func repl(session *Session, apiKey string) {
 				}
 
 			case "/system":
-				if arg != "" {
+				switch {
+				case arg == "":
+					if session.SystemPrompt != "" {
+						fmt.Printf("current system prompt: %s\n", session.SystemPrompt)
+					} else {
+						fmt.Println("current system prompt: (not set)")
+					}
+				case strings.EqualFold(arg, "off") || strings.EqualFold(arg, "clear") || strings.EqualFold(arg, "none"):
+					session.SystemPrompt = ""
+					fmt.Println("system prompt cleared.")
+				default:
 					session.SystemPrompt = arg
 					fmt.Println("system prompt updated.")
-				} else if session.SystemPrompt != "" {
-					fmt.Printf("current system prompt: %s\n", session.SystemPrompt)
-				} else {
-					fmt.Println("current system prompt: (not set)")
 				}
 
 			case "/model":
@@ -3799,7 +3812,11 @@ func main() {
 		if name == "" {
 			name = defaultSessionName()
 		}
-		session = newSession(name, provider, model, flags["system"], baseURL)
+		sys := flags["system"]
+		if sys == "" {
+			sys = defaultSystemPrompt // baked into the session; /system shows/edits/clears it
+		}
+		session = newSession(name, provider, model, sys, baseURL)
 	}
 
 	repl(session, apiKey)

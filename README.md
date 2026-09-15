@@ -114,11 +114,9 @@ description: 定位 K8s 核心组件故障（kubelet/etcd/CNI/CoreDNS…），
 | `write_file` | create/overwrite files | confirms + auto-backup on overwrite; creations are `/undo`-able |
 | `use_skill` | load a playbook | on demand, by exact name |
 
-**Terminal colors**: if text ever looks wrong on your terminal (e.g. code
-blocks invisible on a dark background over SSH), run `frza colortest` to
-identify the offending element, then force the theme with
-`FRZA_THEME=dark|light` — or disable colors entirely with `FRZA_THEME=none`
-(or `NO_COLOR=1`).
+**Terminal colors**: frza auto-detects color depth (truecolor → 256-color
+fallback) and background (light/dark theme). To disable colors entirely, set
+`NO_COLOR=1`.
 
 ## Context & cost discipline
 

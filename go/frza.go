@@ -1770,14 +1770,11 @@ func bashToolDef(name string) Tool {
 //   highlighting. Falls back to plain text when piped, TERM=dumb, or NO_COLOR.
 // --------------------------------------------------------------------------
 
-// frzaTheme reads the FRZA_THEME override: "dark" | "light" | "none" ("" = auto).
-func frzaTheme() string { return strings.ToLower(os.Getenv("FRZA_THEME")) }
-
 func detectColorSupport() bool {
 	if os.Getenv("FRZA_FORCE_COLOR") != "" {
 		return true
 	}
-	if os.Getenv("NO_COLOR") != "" || frzaTheme() == "none" {
+	if os.Getenv("NO_COLOR") != "" {
 		return false
 	}
 	if t := os.Getenv("TERM"); t == "" || t == "dumb" {
@@ -1959,17 +1956,11 @@ func padCell(s string, width int, align string) string {
 	return s + strings.Repeat(" ", gap)
 }
 
-// pickStyle picks a chroma style. FRZA_THEME=dark|light wins; otherwise guess
-// from COLORFGBG (only when set) and default to monokai — troubleshooting
-// servers are dark-background far more often than not, and a light theme on a
-// dark terminal renders code invisible (user report 2026-09-11).
+// pickStyle picks a chroma style from COLORFGBG (only when set), defaulting
+// to monokai — troubleshooting servers are dark-background far more often
+// than not, and a light theme on a dark terminal renders code invisible
+// (user report 2026-09-11).
 func pickStyle() string {
-	switch frzaTheme() {
-	case "dark":
-		return "monokai"
-	case "light":
-		return "github"
-	}
 	if cfb := os.Getenv("COLORFGBG"); cfb != "" {
 		if i := strings.LastIndex(cfb, ";"); i >= 0 {
 			switch cfb[i+1:] {
@@ -3699,9 +3690,6 @@ func main() {
 		case "tooltest": // hidden subcommand: verify tool-calling against the live provider
 			cmdToolTest(args[1:])
 			return
-		case "colortest": // hidden subcommand: print a swatch of every color path
-			cmdColorTest()
-			return
 		}
 	}
 
@@ -4042,41 +4030,3 @@ func truncateStr(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// cmdColorTest is a hidden diagnostic subcommand: it prints one sample of
-// every color path frza emits, so a user on any terminal can point at exactly
-// which elements are illegible. It forces colors on (diagnosis is the point)
-// and prints the auto-detection verdicts alongside.
-func cmdColorTest() {
-	fmt.Printf("TERM=%q COLORFGBG=%q COLORTERM=%q FRZA_THEME=%q\n",
-		os.Getenv("TERM"), os.Getenv("COLORFGBG"), os.Getenv("COLORTERM"), os.Getenv("FRZA_THEME"))
-	fmt.Printf("useColor(auto)=%v pickStyle=%s trueColor=%v (accent codes: %s)\n\n",
-		useColor, pickStyle(), trueColor, map[bool]string{true: "24-bit RGB", false: "256-color"}[trueColor])
-
-	useColor = true // force on for the swatches
-	sample := "net.ipv4.conf.all.rp_filter = 0  # 反向路径过滤被完全关闭（应为 2，宽松模式）"
-
-	fmt.Println("--- frza UI colors ---")
-	fmt.Println(stylize("gray        [auto] read-only command / → result preview / [backup] lines", "gray"))
-	fmt.Println(stylize("red         ⚠ DESTRUCTIVE warnings", "red"))
-	fmt.Println(stylize("green       ok/success accents", "green"))
-	fmt.Println(stylize("inline_code `net.ipv4.conf.all.rp_filter` (paths & params in prose)", "inline_code"))
-	fmt.Printf("spinner     %sshimmer base%s / %sshimmer hot%s (thinking indicator)\n\n",
-		shimmerBase, ansiCodes["reset"], shimmerHot, ansiCodes["reset"])
-
-	fmt.Println("--- code block highlighting (the usual suspect) ---")
-	oldTheme := os.Getenv("FRZA_THEME")
-	os.Setenv("FRZA_THEME", "dark")
-	fmt.Println("[monokai / dark theme — should be readable on black]")
-	fmt.Println(highlightCode(sample, "bash"))
-	os.Setenv("FRZA_THEME", "light")
-	fmt.Println("[github / light theme — expect INVISIBLE text on black]")
-	fmt.Println(highlightCode(sample, "bash"))
-	os.Setenv("FRZA_THEME", oldTheme)
-
-	fmt.Println("--- table borders ---")
-	fmt.Println(renderMarkdown("| param | value |\n|---|---|\n| rp_filter | 0 |"))
-
-	fmt.Println("If any line above is invisible/hard to read, note its label and set")
-	fmt.Println("FRZA_THEME=dark (or light) to force the theme, FRZA_THEME=none to")
-	fmt.Println("disable all colors. NO_COLOR=1 works too.")
-}

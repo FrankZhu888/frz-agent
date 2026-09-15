@@ -134,9 +134,9 @@ is the point of skills being portable playbooks rather than code.
 5. After mitigation: `/export` the session to Markdown as postmortem material;
    journal + session together are the evidence trail
 
-Terminal acting up over SSH (invisible text, wrong colors)? `frza colortest`
-shows a swatch of every color path; force `FRZA_THEME=dark|light` or switch
-colors off with `FRZA_THEME=none` / `NO_COLOR=1`.
+Terminal acting up over SSH (invisible text, wrong colors)? frza falls back
+to 256-color automatically when the terminal lacks truecolor; to switch
+colors off entirely, set `NO_COLOR=1`.
 
 ## Network & data checklist
 

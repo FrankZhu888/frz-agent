@@ -2544,8 +2544,11 @@ func (s *streamRenderer) emit(line string) {
 // shimmer sweep.
 // --------------------------------------------------------------------------
 
-var thinkingVerbs = []string{"Thinking", "Pondering", "Mulling", "Brewing", "Wondering",
-	"Deliberating", "Computing", "Searching", "Weaving", "Wandering"}
+// Troubleshooting-flavored spinner verbs: the tool is used during incidents,
+// so the vocabulary stays professional (the inherited Claude-Code-style list
+// had Brewing/Weaving/Wandering — off-tone for an on-call screen).
+var thinkingVerbs = []string{"Thinking", "Analyzing", "Investigating", "Diagnosing",
+	"Checking", "Researching", "Reasoning", "Correlating", "Inspecting", "Tracing"}
 
 const shimmerW = 4
 

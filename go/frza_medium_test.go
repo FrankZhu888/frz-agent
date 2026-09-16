@@ -133,6 +133,43 @@ func TestAlwaysCovers(t *testing.T) {
 	if alwaysCovers("bash", riskReversible) {
 		t.Errorf("resetAlwaysApproved did not clear approvals")
 	}
+
+	// exact-command memory is cleared too
+	alwaysApprovedCmd["rm -rf /x"] = true
+	resetAlwaysApproved()
+	if alwaysApprovedCmd["rm -rf /x"] {
+		t.Errorf("resetAlwaysApproved did not clear exact-command approvals")
+	}
+}
+
+// TestPrepareDangerousBackups: the tier decision — a dangerous command with
+// all targets backed up is effectively reversible; one with no backupable
+// target (or a failed backup) is not.
+func TestPrepareDangerousBackups(t *testing.T) {
+	tmp := t.TempDir()
+	oldBackup := backupDir
+	backupDir = filepath.Join(tmp, "backups")
+	t.Cleanup(func() { backupDir = oldBackup })
+
+	existing := filepath.Join(tmp, "data.log")
+	os.WriteFile(existing, []byte("important"), 0o600)
+
+	// no backupable target: genuinely irreversible
+	if _, ok := prepareDangerousBackups("s", "systemctl restart nginx"); ok {
+		t.Errorf("systemctl restart should NOT count as backed up")
+	}
+	if _, ok := prepareDangerousBackups("s", "dd if=/dev/zero of=/dev/sda"); ok {
+		t.Errorf("dd should NOT count as backed up")
+	}
+	// all targets backed up: effectively reversible
+	backups, ok := prepareDangerousBackups("s", "rm "+existing)
+	if !ok || len(backups) != 1 {
+		t.Errorf("rm of existing file should be fully backed up: %v %v", backups, ok)
+	}
+	// any failed target (missing file) demotes the command back to irreversible
+	if _, ok := prepareDangerousBackups("s", "rm "+existing+" "+filepath.Join(tmp, "ghost")); ok {
+		t.Errorf("rm with a missing target should NOT count as fully backed up")
+	}
 }
 
 // TestParseFlagsNoSwallow (audit 3.9): `--model --agent` must not set the

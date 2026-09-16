@@ -3259,9 +3259,10 @@ func agentToolsOffered() []Tool {
 }
 
 // alwaysApproved remembers "a" answers for the current session (cleared on
-// /new). It never covers dangerous commands — those re-ask every time
-// (audit 3.9: one "a" must not silently approve later `rm -rf`-grade calls,
-// and approvals must not leak into a fresh session).
+// /new; audit 3.9). It covers dangerous commands ONLY when their targets
+// were all backed up pre-confirmation (effectively reversible); genuinely
+// irreversible dangerous commands use alwaysApprovedCmd instead (see
+// prepareDangerousBackups).
 var alwaysApproved = map[string]bool{}
 
 // alwaysCovers reports whether a remembered "always" answer auto-approves
@@ -3270,10 +3271,40 @@ func alwaysCovers(toolName string, risk commandRisk) bool {
 	return alwaysApproved[toolName] && risk != riskDangerous
 }
 
+// alwaysApprovedCmd remembers "a" answers for exact irreversible commands
+// (dangerous with no backupable target: dd, kill, systemctl, reboot...).
+// Only the identical command string is covered — any variation asks again.
+// Cleared on /new together with alwaysApproved.
+var alwaysApprovedCmd = map[string]bool{}
+
 func resetAlwaysApproved() {
 	for k := range alwaysApproved {
 		delete(alwaysApproved, k)
 	}
+	for k := range alwaysApprovedCmd {
+		delete(alwaysApprovedCmd, k)
+	}
+}
+
+// prepareDangerousBackups backs up every identifiable target of a dangerous
+// command BEFORE confirmation (a backup is a read-only copy, so doing it
+// early is side-effect-free). allBackedUp is false when there is nothing to
+// back up or any target fails — such commands are genuinely irreversible
+// and keep the strict confirmation tier.
+func prepareDangerousBackups(sessionName, fullCmd string) (backups []string, allBackedUp bool) {
+	targets := backupTargetsFor(fullCmd)
+	if len(targets) == 0 {
+		return nil, false
+	}
+	all := true
+	for _, target := range targets {
+		if dst := backupFile(sessionName, target); dst != "" {
+			backups = append(backups, target+" -> "+dst)
+		} else {
+			all = false
+		}
+	}
+	return backups, all
 }
 
 // Agent tunables; defaults here, overridable via config.json "agent" section
@@ -3483,27 +3514,61 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 			risk := riskUnknown
 			confirmMode := "auto"
 			approved := true
+			var backups []string // pre-confirmation backups of dangerous targets
+			dangerousBackedUp := false
 			if tool.Confirm {
+				fullCmd := ""
 				if tc.Name == "bash" || tc.Name == "exec" {
-					risk = classifyCommand(bashCommandOf(tc))
+					fullCmd = bashCommandOf(tc)
+					risk = classifyCommand(fullCmd)
+				}
+				// Tiered dangerous handling: a dangerous command whose targets
+				// are all safely backed up is effectively reversible, so "a"
+				// covers it like any reversible call. Truly irreversible ones
+				// (no backupable target: dd/kill/systemctl/reboot) fall back
+				// to per-exact-command memory.
+				if risk == riskDangerous && fullCmd != "" {
+					backups, dangerousBackedUp = prepareDangerousBackups(session.Name, fullCmd)
+					for _, b := range backups {
+						fmt.Println(stylize(fmt.Sprintf("  [backup] %s", b), "gray"))
+					}
+				}
+				autoRisk := risk
+				if dangerousBackedUp {
+					autoRisk = riskReversible
 				}
 				switch {
 				case risk == riskReadonly:
 					fmt.Println(stylize("  [auto] read-only command", "gray"))
-				case alwaysCovers(tc.Name, risk):
+				case alwaysCovers(tc.Name, autoRisk):
 					confirmMode = "always"
 					fmt.Println(stylize("  [auto] pre-approved this session", "gray"))
+				case risk == riskDangerous && !dangerousBackedUp && alwaysApprovedCmd[fullCmd]:
+					confirmMode = "always"
+					fmt.Println(stylize("  [auto] pre-approved this exact command", "gray"))
 				default:
 					if risk == riskDangerous {
-						fmt.Println(stylize("  ⚠ DESTRUCTIVE / NOT auto-reversible — no automatic undo possible", "red"))
+						if dangerousBackedUp {
+							fmt.Println(stylize("  ⚠ destructive — targets backed up above, /undo can restore", "yellow"))
+						} else {
+							fmt.Println(stylize("  ⚠ DESTRUCTIVE / NOT auto-reversible — no automatic undo possible", "red"))
+						}
+					}
+					prompt := "  execute? [y]es/[n]o/[a]lways: "
+					if risk == riskDangerous && !dangerousBackedUp {
+						prompt = "  execute? [y]es/[n]o/[a]lways this exact command: "
 					}
 					ans := "y"
 					if ask != nil {
-						ans = ask(fmt.Sprintf("  execute? [y]es/[n]o/[a]lways: "))
+						ans = ask(prompt)
 					}
 					confirmMode = ans
 					if ans == "a" {
-						alwaysApproved[tc.Name] = true
+						if risk == riskDangerous && !dangerousBackedUp {
+							alwaysApprovedCmd[fullCmd] = true
+						} else {
+							alwaysApproved[tc.Name] = true
+						}
 					} else if ans != "y" {
 						approved = false
 					}
@@ -3520,18 +3585,11 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 					Risk: riskName(risk), Result: "declined by user",
 				})
 			} else {
-				// Destructive op approved: back up identifiable targets first (§3.6)
-				var backups []string
+				// Dangerous bash targets were already backed up at the
+				// confirmation gate (before the user answered). write_file
+				// backs up here (overwrite) or marks creation for undo.
 				var writeNewPath string // write_file creating a new file (undo = delete)
-				switch {
-				case risk == riskDangerous && (tc.Name == "bash" || tc.Name == "exec"):
-					for _, target := range backupTargetsFor(bashCommandOf(tc)) {
-						if dst := backupFile(session.Name, target); dst != "" {
-							backups = append(backups, target+" -> "+dst)
-							fmt.Println(stylize(fmt.Sprintf("  [backup] %s -> %s", target, dst), "gray"))
-						}
-					}
-				case tc.Name == "write_file":
+				if tc.Name == "write_file" {
 					// Overwriting: back up the original; creating: undo = delete
 					var wargs struct {
 						Path string `json:"path"`

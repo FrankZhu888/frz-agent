@@ -10,7 +10,7 @@
 // Features:
 //   - Agent loop with function calling over the OpenAI Responses API
 //     (SSE streaming; verified against Volcengine Ark / kimi-k3)
-//   - Built-in tools: bash (60s timeout, truncated output), read_file
+//   - Built-in tools: bash (120s default timeout, truncated output), read_file
 //     (offset/limit, binary detection), search (regex, capped), write_file
 //     (backup-on-overwrite), use_skill (on-demand playbook loading)
 //   - Skills: directory playbooks (~/.frza/skills/, repo skills/), two-level
@@ -32,6 +32,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -43,6 +44,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -163,20 +165,66 @@ func loadConfig() map[string]interface{} {
 
 func saveConfig(cfg map[string]interface{}) {
 	ensureDirs()
-	writeJSONFile(configFile, cfg)
-	os.Chmod(configFile, 0o600)
+	if err := writeJSONFile(configFile, cfg, 0o600); err != nil {
+		fmt.Println(stylize("[error] cannot write config: "+err.Error(), "red"))
+	}
 }
 
-// writeJSONFile writes JSON with indent=2 without escaping HTML/Unicode
-func writeJSONFile(path string, v interface{}) {
+// checkConfigIntact guards `config set` against a corrupted config file:
+// loadConfig treats unparseable JSON as empty, so a set would silently
+// overwrite and destroy every existing key (audit C2). The corrupted file is
+// preserved at config.json.bak for manual recovery before we refuse.
+func checkConfigIntact() error {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return nil // missing file: starting fresh is fine
+	}
+	var probe map[string]interface{}
+	if json.Unmarshal(data, &probe) == nil {
+		return nil
+	}
+	if berr := os.WriteFile(configFile+".bak", data, 0o600); berr == nil {
+		return fmt.Errorf("%s is corrupted (backed up to %s.bak); fix or delete it before running config set", configFile, configFile)
+	}
+	return fmt.Errorf("%s is corrupted; fix or delete it before running config set", configFile)
+}
+
+// writeJSONFile writes JSON with indent=2 without escaping HTML/Unicode.
+// The write is atomic — a temp file in the same directory is fsync'd and
+// renamed over the target — so a crash mid-write never leaves a truncated
+// session/config behind (audit C1). Files are created with the given mode;
+// sessions and config hold unredacted conversation/credentials and must be
+// 0600 like the journal (audit C3).
+func writeJSONFile(path string, v interface{}, mode os.FileMode) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
-		return
+		return err
 	}
-	os.WriteFile(path, buf.Bytes(), 0o644)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func cfgStr(cfg map[string]interface{}, key string) string {
@@ -294,7 +342,10 @@ func saveSession(s *Session, force bool) (string, bool) {
 	ensureDirs()
 	s.UpdatedAt = time.Now().Format("2006-01-02T15:04:05")
 	path := sessionPath(s.Name)
-	writeJSONFile(path, s)
+	if err := writeJSONFile(path, s, 0o600); err != nil {
+		fmt.Println(stylize("[error] cannot save session: "+err.Error(), "red"))
+		return "", false
+	}
 	return path, true
 }
 
@@ -322,11 +373,36 @@ func renameSessionFile(oldName, newName string) (bool, string) {
 	}
 	s["name"] = newName
 	s["updated_at"] = nowISO()
-	writeJSONFile(newPath, s)
+	// Never delete the original until the new file is durably in place —
+	// otherwise a full disk turns a rename into data loss (audit C1).
+	if err := writeJSONFile(newPath, s, 0o600); err != nil {
+		return false, fmt.Sprintf("cannot write %q: %v (original session kept)", newName, err)
+	}
 	if newPath != oldPath {
 		os.Remove(oldPath)
 	}
 	return true, newPath
+}
+
+// migrateSessionArtifacts moves the journal and backup directory over to a
+// new session name so /undo keeps working across /rename and /save <new>
+// (audit 3.5). Best-effort: a failed move is reported, never fatal.
+func migrateSessionArtifacts(oldName, newName string) {
+	if oldName == "" || newName == "" || oldName == newName {
+		return
+	}
+	oldJ, newJ := journalPath(oldName), journalPath(newName)
+	if _, err := os.Stat(oldJ); err == nil {
+		if err := os.Rename(oldJ, newJ); err != nil {
+			fmt.Println(stylize("[warn] could not migrate journal: "+err.Error(), "yellow"))
+		}
+	}
+	oldB := filepath.Join(backupDir, oldName)
+	if _, err := os.Stat(oldB); err == nil {
+		if err := os.Rename(oldB, filepath.Join(backupDir, newName)); err != nil {
+			fmt.Println(stylize("[warn] could not migrate backups: "+err.Error(), "yellow"))
+		}
+	}
 }
 
 func loadSession(name string) *Session {
@@ -379,7 +455,10 @@ func exportSession(s *Session, dest string) (string, bool) {
 	os.MkdirAll(filepath.Dir(path), 0o755)
 	_, err := os.Stat(path)
 	overwritten := err == nil
-	os.WriteFile(path, []byte(b.String()), 0o644)
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		fmt.Println(stylize("[error] cannot export session: "+err.Error(), "red"))
+		return "", false
+	}
 	return path, overwritten
 }
 
@@ -394,25 +473,21 @@ func httpPostJSON(ctx context.Context, url string, headers map[string]string, pa
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	resp, err := doWithRetries(ctx, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		return req, nil
+	}, httpClientSync, nil)
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		if ctx.Err() == context.Canceled {
-			return nil, errInterrupted
-		}
-		return nil, fmt.Errorf("network error: %v", err)
-	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %v", err)
@@ -421,12 +496,98 @@ func httpPostJSON(ctx context.Context, url string, headers map[string]string, pa
 }
 
 // No overall timeout on streaming requests (long generations could exceed any
-// fixed total deadline); cancellation is done via context.
+// fixed total deadline); cancellation is done via context, and the SSE parser
+// has its own idle watchdog.
 var httpClient = &http.Client{}
+
+// httpClientSync serves the non-streaming chat calls (anthropic/openai/
+// gemini): a server that accepts the connection but never answers must not
+// hang the REPL forever (audit 3.7). Retries come from doWithRetries.
+var httpClientSync = &http.Client{
+	Timeout: 5 * time.Minute,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ResponseHeaderTimeout: 60 * time.Second,
+	},
+}
+
+// Caps on response bodies read into memory (audit 3.7: an uncapped ReadAll
+// lets a misconfigured base-url OOM the process; error bodies likewise).
+const (
+	maxResponseBodyBytes = 10 << 20
+	maxErrorBodyBytes    = 1 << 20
+)
 
 // retryBackoffs for transient API failures (429/5xx/network); a var so tests
 // can shrink the waits.
 var retryBackoffs = []time.Duration{time.Second, 4 * time.Second, 15 * time.Second}
+
+// retryAfterDelay parses a Retry-After header (delta-seconds or HTTP-date).
+func retryAfterDelay(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// doWithRetries issues an HTTP request, retrying network errors and 429/5xx
+// (design §3.7: agent loops amplify call counts, so transient blips are the
+// norm). A Retry-After header on 429 wins over the schedule when it asks for
+// a longer wait (audit 3.7); other 4xx fail fast. makeReq must build a fresh
+// request per attempt. The caller owns the returned body.
+func doWithRetries(ctx context.Context, makeReq func() (*http.Request, error), client *http.Client, onRetry func(string)) (*http.Response, error) {
+	backoffs := retryBackoffs
+	for attempt := 0; ; attempt++ {
+		req, err := makeReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
+		var failMsg string
+		var delay time.Duration
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				return nil, errInterrupted
+			}
+			failMsg = fmt.Sprintf("network error: %v", err)
+		} else if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+			resp.Body.Close()
+			failMsg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncateStr(string(body), 200))
+			if resp.StatusCode == 429 {
+				delay = retryAfterDelay(resp.Header.Get("Retry-After"))
+			}
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(string(body), 500))
+		} else {
+			return resp, nil
+		}
+		if attempt >= len(backoffs) {
+			return nil, fmt.Errorf("%s (after %d attempts)", failMsg, attempt+1)
+		}
+		if d := backoffs[attempt]; d > delay {
+			delay = d
+		}
+		if onRetry != nil {
+			onRetry(fmt.Sprintf("retry %d/%d after: %s", attempt+1, len(backoffs), failMsg))
+		}
+		select {
+		case <-ctx.Done():
+			return nil, errInterrupted
+		case <-time.After(delay):
+		}
+	}
+}
 
 func asMap(v interface{}) map[string]interface{} {
 	m, _ := v.(map[string]interface{})
@@ -452,7 +613,12 @@ func callAnthropic(ctx context.Context, messages []Message, system, model, apiKe
 	if system != "" {
 		payload["system"] = system
 	}
-	result, err := httpPostJSON(ctx, "https://api.anthropic.com/v1/messages", map[string]string{
+	// Respect a configured gateway/proxy like callOpenAI does (audit 3.7)
+	url := "https://api.anthropic.com/v1/messages"
+	if baseURL != "" {
+		url = strings.TrimRight(baseURL, "/") + "/v1/messages"
+	}
+	result, err := httpPostJSON(ctx, url, map[string]string{
 		"content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01",
 	}, payload)
 	if err != nil {
@@ -482,9 +648,20 @@ func callOpenAI(ctx context.Context, messages []Message, system, model, apiKey, 
 	// Newer models (o1/o3 etc.) only accept max_completion_tokens; the legacy
 	// max_tokens parameter is rejected with 400
 	payload := map[string]interface{}{"model": model, "messages": msgs, "max_completion_tokens": 8192}
-	result, err := httpPostJSON(ctx, url, map[string]string{
+	headers := map[string]string{
 		"content-type": "application/json", "authorization": "Bearer " + apiKey,
-	}, payload)
+	}
+	result, err := httpPostJSON(ctx, url, headers, payload)
+	if err != nil && strings.HasPrefix(err.Error(), "HTTP 400:") &&
+		(strings.Contains(err.Error(), "max_completion_tokens") ||
+			strings.Contains(err.Error(), "unrecognized") ||
+			strings.Contains(err.Error(), "unsupported")) {
+		// Many OpenAI-compatible gateways (vLLM, older proxies) only know the
+		// legacy parameter; fall back once (audit 3.7).
+		payload["max_tokens"] = payload["max_completion_tokens"]
+		delete(payload, "max_completion_tokens")
+		result, err = httpPostJSON(ctx, url, headers, payload)
+	}
 	if err != nil {
 		return CallResult{}, err
 	}
@@ -495,8 +672,22 @@ func callOpenAI(ctx context.Context, messages []Message, system, model, apiKey, 
 	return CallResult{Text: asString(asMap(asMap(choices[0])["message"])["content"])}, nil
 }
 
+// geminiEndpoint builds the generateContent URL and auth headers. The API key
+// travels in the x-goog-api-key header, never the URL query: Go's *url.Error
+// includes the full URL, so a query-string key would leak into error output
+// and terminal scrollback (audit B1). A configured baseURL replaces the
+// default API host, like callOpenAI (audit 3.7).
+func geminiEndpoint(model, apiKey, baseURL string) (string, map[string]string) {
+	base := "https://generativelanguage.googleapis.com/v1beta"
+	if baseURL != "" {
+		base = strings.TrimRight(baseURL, "/")
+	}
+	url := fmt.Sprintf("%s/models/%s:generateContent", base, model)
+	return url, map[string]string{"content-type": "application/json", "x-goog-api-key": apiKey}
+}
+
 func callGemini(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, tools []Tool, onDelta, onReasoning func(string)) (CallResult, error) {
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+	url, headers := geminiEndpoint(model, apiKey, baseURL)
 	contents := []map[string]interface{}{}
 	for _, m := range messages {
 		role := "user"
@@ -514,7 +705,7 @@ func callGemini(ctx context.Context, messages []Message, system, model, apiKey, 
 	if system != "" {
 		payload["systemInstruction"] = map[string]interface{}{"parts": []map[string]string{{"text": system}}}
 	}
-	result, err := httpPostJSON(ctx, url, map[string]string{"content-type": "application/json"}, payload)
+	result, err := httpPostJSON(ctx, url, headers, payload)
 	if err != nil {
 		return CallResult{}, err
 	}
@@ -588,56 +779,67 @@ func callOpenAIResponses(ctx context.Context, messages []Message, system, model,
 	}
 	data, _ := json.Marshal(payload)
 
-	// Retry transient failures (design §3.7): agent loops amplify call counts,
-	// so 429/5xx/network blips are the norm. Backoff 1s/4s/15s; auth and other
-	// 4xx fail fast. Retries heartbeat via onReasoning to keep the spinner alive.
-	var resp *http.Response
-	backoffs := retryBackoffs
-	for attempt := 0; ; attempt++ {
+	// Transient failures (429/5xx/network) retry with backoff; auth and other
+	// 4xx fail fast. Retries heartbeat via onReasoning to keep the spinner
+	// alive.
+	resp, err := doWithRetries(ctx, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 		if err != nil {
-			return CallResult{}, err
+			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
-
-		resp, err = httpClient.Do(req)
-		retryable := false
-		var failMsg string
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				return CallResult{}, errInterrupted
-			}
-			retryable = true
-			failMsg = fmt.Sprintf("network error: %v", err)
-		} else if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			retryable = true
-			failMsg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncateStr(string(body), 200))
-		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return CallResult{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-		}
-		if !retryable {
-			break
-		}
-		if attempt >= len(backoffs) {
-			return CallResult{}, fmt.Errorf("%s (after %d retries)", failMsg, attempt)
-		}
-		if onReasoning != nil {
-			onReasoning(fmt.Sprintf("retry %d/%d after: %s", attempt+1, len(backoffs), failMsg))
-		}
-		select {
-		case <-ctx.Done():
-			return CallResult{}, errInterrupted
-		case <-time.After(backoffs[attempt]):
-		}
+		return req, nil
+	}, httpClient, onReasoning)
+	if err != nil {
+		return CallResult{}, err
 	}
 	defer resp.Body.Close()
 
-	return parseResponsesSSE(ctx, resp.Body, onDelta, onReasoning)
+	// Watchdog against half-open connections: a stream that starts but then
+	// goes silent without closing must not spin forever (audit 3.7).
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+	body := &idleTimeoutReader{body: resp.Body, timeout: streamIdleTimeout, cancel: streamCancel}
+	return parseResponsesSSE(streamCtx, body, onDelta, onReasoning)
+}
+
+// streamIdleTimeout bounds how long the SSE parser waits for the next byte
+// before declaring the stream stalled. A var so tests can shrink it.
+var streamIdleTimeout = 120 * time.Second
+
+var errStreamIdle = errors.New("stream idle timeout (no bytes received)")
+
+// idleTimeoutReader fails the read with errStreamIdle when no bytes arrive
+// within timeout — SSE streams produce something (text, reasoning, gateway
+// keep-alives) every few seconds, so a long silence means a half-open
+// connection (audit 3.7). cancel tears down the connection so the blocked
+// underlying read returns.
+type idleTimeoutReader struct {
+	body    io.Reader
+	timeout time.Duration
+	cancel  context.CancelFunc
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := r.body.Read(p)
+		ch <- result{n, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-time.After(r.timeout):
+		if r.cancel != nil {
+			r.cancel()
+		}
+		return 0, errStreamIdle
+	}
 }
 
 // parseResponsesSSE consumes the SSE stream of the Responses API and returns
@@ -729,6 +931,11 @@ func parseResponsesSSE(ctx context.Context, body io.Reader, onDelta, onReasoning
 			}
 		}
 		if err != nil {
+			// Idle watchdog fired before any ctx cancellation — report the
+			// stall, not a user interrupt (audit 3.7).
+			if errors.Is(err, errStreamIdle) {
+				return CallResult{}, fmt.Errorf("stream stalled (no data for %s): %w", streamIdleTimeout, err)
+			}
 			if ctx.Err() == context.Canceled {
 				return CallResult{}, errInterrupted
 			}
@@ -784,19 +991,23 @@ const (
 var readonlyCmds = map[string]bool{
 	"ls": true, "cat": true, "grep": true, "egrep": true, "fgrep": true, "zgrep": true,
 	"head": true, "tail": true, "less": true, "more": true, "wc": true, "sort": true,
-	"uniq": true, "awk": true, "sed": true, "cut": true, "tr": true, "diff": true,
+	"uniq": true, "cut": true, "tr": true, "diff": true,
 	"find": true, "which": true, "whereis": true, "type": true, "file": true, "stat": true,
 	"df": true, "du": true, "free": true, "top": true, "htop": true, "ps": true,
 	"uptime": true, "uname": true, "hostname": true, "whoami": true, "id": true, "w": true,
-	"date": true, "cal": true, "env": true, "printenv": true, "echo": true, "printf": true,
+	"date": true, "cal": true, "printenv": true, "echo": true, "printf": true,
 	"pwd": true, "history": true, "alias": true, "jobs": true,
 	"dmesg": true, "vmstat": true, "iostat": true, "mpstat": true, "pidstat": true,
 	"ss": true, "netstat": true, "ip": true, "ifconfig": true, "ping": true, "dig": true,
 	"nslookup": true, "host": true, "traceroute": true,
 	"lsof": true, "lsblk": true, "lsmod": true, "lspci": true, "lsusb": true, "lscpu": true,
 	"journalctl": true, "last": true, "lastlog": true, "crash": true,
-	"zcat": true, "zipinfo": true, "xargs": true, "jq": true, "strings": true,
+	"zcat": true, "zipinfo": true, "jq": true, "strings": true,
 	"nm": true, "objdump": true, "readelf": true, "pstack": true,
+	// Deliberately NOT whitelisted (audit A2): xargs/env execute the command
+	// they wrap (`ls | xargs mv`, `env mv a b`), and awk/sed scripts can run
+	// commands (system(), `e` cmd) or write files (`w file`, -i) in ways field
+	// matching cannot detect. They fall through to riskReversible (confirm).
 }
 
 // readonlySubcmds: read-only only for specific subcommands (checked against the
@@ -806,10 +1017,10 @@ var readonlySubcmds = map[string][]string{
 	"kubectl":   {"get", "describe", "logs", "explain", "api-resources", "api-versions", "cluster-info", "top"},
 	// branch/tag/remote deliberately excluded: their bare forms list, but
 	// `git branch -D`, `git tag -d`, `git remote remove` delete (review F3)
-	"git": {"status", "log", "diff", "show", "blame", "ls-files", "rev-parse"},
-	"tar":       {"-tf", "-tvf", "--list"},
-	"sysctl":    {"-a", "-n"},
-	"mount":     {""}, // bare `mount` only
+	"git":    {"status", "log", "diff", "show", "blame", "ls-files", "rev-parse"},
+	"tar":    {"-tf", "-tvf", "--list"},
+	"sysctl": {"-a", "-n"},
+	"mount":  {""}, // bare `mount` only
 }
 
 // dangerousPatterns matched against the raw (unsplit) command; any hit
@@ -878,6 +1089,40 @@ func splitChain(cmd string) []string {
 	return segs
 }
 
+// splitShellFields splits a command segment into fields while respecting
+// single/double quotes — `rm "a b"` yields the single operand `a b`, unlike
+// strings.Fields which would split it in two (audit 3.9). Quotes are stripped
+// from the result. Best-effort, like splitChain.
+func splitShellFields(seg string) []string {
+	var fields []string
+	var b strings.Builder
+	var quote rune // 0, '\'', or '"'
+	flush := func() {
+		if b.Len() > 0 {
+			fields = append(fields, b.String())
+			b.Reset()
+		}
+	}
+	for _, r := range seg {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				b.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+		case r == ' ' || r == '\t':
+			flush()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	flush()
+	return fields
+}
+
 func firstToken(seg string) string {
 	fields := strings.Fields(seg)
 	if len(fields) == 0 {
@@ -898,14 +1143,11 @@ func nthToken(seg string, n int) string {
 // A whitelisted command carrying any of these is NOT read-only — e.g.
 // `sed -i`, `find -delete`, `sort -o`, `journalctl --vacuum-*`.
 var writeFlags = map[string][]string{
-	"sed":        {"-i", "--in-place", "-i.bak"},
 	"find":       {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf"},
 	"sort":       {"-o", "--output"},
-	"awk":        {"-i", "--include"}, // gawk inplace extension is -i inplace
 	"journalctl": {"--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync", "--relinquish-var"},
 	"ip":         {"add", "del", "delete", "set", "change", "replace", "flush", "save", "restore"},
 	"ifconfig":   {"up", "down", "add", "delete"},
-	"xargs":      {"-I", "--replace"}, // -I makes arbitrary command construction trivial
 }
 
 // isReadonlySegment reports whether a single chain segment is a known
@@ -931,11 +1173,18 @@ func isReadonlySegment(seg string) bool {
 	if !readonlyCmds[tok] {
 		return false
 	}
-	// whitelisted command, but a write-capable flag/subcommand revokes it
+	// whitelisted command, but a write-capable flag/subcommand revokes it.
+	// Short options match by prefix so attached values can't slip past
+	// (`sort -oout.txt`; audit A3); long options and subcommand words
+	// require an exact or `--flag=value` match.
 	if bad, ok := writeFlags[tok]; ok {
 		for _, field := range strings.Fields(seg)[1:] {
 			for _, b := range bad {
-				if field == b || strings.HasPrefix(field, b+"=") {
+				if len(b) >= 2 && b[0] == '-' && b[1] != '-' {
+					if strings.HasPrefix(field, b) {
+						return false
+					}
+				} else if field == b || strings.HasPrefix(field, b+"=") {
 					return false
 				}
 			}
@@ -944,18 +1193,23 @@ func isReadonlySegment(seg string) bool {
 	return true
 }
 
-// nullRedirect matches harmless output discards: 2>/dev/null, 2>&1, &>,
-// >/dev/null 2>&1 etc. These are idiomatic noise suppression, not writes —
-// without stripping them, `du -sh . 2>/dev/null` would match the
-// overwrite-redirect dangerous pattern.
-var nullRedirect = regexp.MustCompile(`\s+(&>|\d*>&\d+|\d*>+\s*/dev/null|>+\s*/dev/null)(\s+2>&1)?`)
+// nullRedirect matches harmless output discards: 2>/dev/null, 2>&1,
+// &>/dev/null, >/dev/null 2>&1 etc. These are idiomatic noise suppression,
+// not writes — without stripping them, `du -sh . 2>/dev/null` would match the
+// overwrite-redirect dangerous pattern. `&>` is stripped ONLY when its target
+// is /dev/null: `cmd &> file` is a combined stdout+stderr overwrite and must
+// stay visible to the dangerous-pattern scan (audit A1).
+var nullRedirect = regexp.MustCompile(`\s+(&>+\s*/dev/null|\d*>&\d+|\d*>+\s*/dev/null|>+\s*/dev/null)(\s+2>&1)?`)
 
 // classifyCommand implements the design doc §3.6: split the chain, grade every
-// segment, take the worst. Command substitution $(...)/backticks cannot be
-// statically graded -> riskUnknown. Dangerous raw patterns escalate.
+// segment, take the worst. Command substitution $(...)/backticks and process
+// substitution <(...)/>(...) cannot be statically graded -> riskUnknown
+// (audit A4: `cat <(mv a b)` must not auto-run). Dangerous raw patterns
+// escalate.
 func classifyCommand(cmd string) commandRisk {
 	cmd = nullRedirect.ReplaceAllString(cmd, "")
-	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") {
+	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") ||
+		strings.Contains(cmd, "<(") || strings.Contains(cmd, ">(") {
 		return riskUnknown
 	}
 	for _, re := range dangerousPatterns {
@@ -1084,7 +1338,26 @@ func truncateToolOutput(s string, headLines, tailLines, maxBytes int) string {
 		s = strings.Join(kept, "\n")
 	}
 	if len(s) > maxBytes {
-		s = s[:maxBytes] + fmt.Sprintf("\n[... truncated at %d bytes ...]", maxBytes)
+		s = cutAtRuneBoundary(s, maxBytes) + fmt.Sprintf("\n[... truncated at %d bytes ...]", maxBytes)
+	}
+	return s
+}
+
+// cutAtRuneBoundary shortens s to at most n bytes without splitting a
+// multibyte UTF-8 rune (byte slicing mid-rune produces invalid UTF-8, which
+// renders as U+FFFD for the model and the user; audit 3.8). If the cut may
+// have left an open ANSI escape sequence, a reset is appended so the style
+// doesn't bleed into whatever follows.
+func cutAtRuneBoundary(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && (s[n]&0xC0) == 0x80 {
+		n-- // UTF-8 continuation byte: back off to the rune start
+	}
+	s = s[:n]
+	if strings.Contains(s, "\033[") {
+		s += "\033[0m"
 	}
 	return s
 }
@@ -1153,10 +1426,12 @@ func backupFile(sessionName, path string) string {
 	return dst
 }
 
-// rmTargetRe finds file operands of rm (skipping flags); redirectTargetRe finds
-// overwrite targets of > / >> (excluding fd merges and /dev/null).
+// rmTargetRe finds file operands of rm (skipping flags and an optional
+// sudo/doas prefix — `sudo rm -rf /data` deserves a backup just the same,
+// audit 3.9); redirectTargetRe finds overwrite targets of > / >> (excluding
+// fd merges and /dev/null).
 var (
-	rmTargetRe       = regexp.MustCompile(`(?:^|&&|\|\||;|\|)\s*rm\s+((?:-\S+\s+)*)([^;&|]+)`)
+	rmTargetRe       = regexp.MustCompile(`(?:^|&&|\|\||;|\|)\s*(?:sudo\s+|doas\s+)?rm\s+((?:-\S+\s+)*)([^;&|]+)`)
 	redirectTargetRe = regexp.MustCompile(`(?:^|[^0-9&>])>>?\s*([^&\s|;]+)`)
 )
 
@@ -1165,14 +1440,14 @@ var (
 func backupTargetsFor(cmd string) []string {
 	var targets []string
 	for _, m := range rmTargetRe.FindAllStringSubmatch(cmd, -1) {
-		for _, f := range strings.Fields(m[2]) {
+		for _, f := range splitShellFields(m[2]) {
 			if !strings.HasPrefix(f, "-") {
 				targets = append(targets, f)
 			}
 		}
 	}
 	for _, m := range redirectTargetRe.FindAllStringSubmatch(cmd, -1) {
-		t := m[1]
+		t := strings.Trim(m[1], "\"'")
 		if t != "/dev/null" && !strings.HasPrefix(t, "/dev/fd") {
 			targets = append(targets, t)
 		}
@@ -1208,7 +1483,9 @@ func journalWrite(e journalEntry) {
 		return
 	}
 	defer f.Close()
-	f.Write(append(data, '\n'))
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		fmt.Println(stylize("[error] journal write failed: "+err.Error(), "red"))
+	}
 	os.Chmod(p, 0o600)
 }
 
@@ -1253,7 +1530,15 @@ func undoLatest(sessionName string) string {
 			if err != nil {
 				return fmt.Sprintf("backup %s missing: %v", e.BackupTo, err)
 			}
-			if err := os.WriteFile(e.BackupOf, data, 0o644); err != nil {
+			// Restore the original permission bits too — the backup file
+			// itself carries them (see backupFile). A 0600 config must not
+			// come back world-readable and a script must not lose its exec
+			// bit (audit 3.6).
+			mode := os.FileMode(0o644)
+			if info, serr := os.Stat(e.BackupTo); serr == nil {
+				mode = info.Mode().Perm()
+			}
+			if err := os.WriteFile(e.BackupOf, data, mode); err != nil {
 				return fmt.Sprintf("restore failed: %v", err)
 			}
 			journalWrite(journalEntry{Time: now, Session: sessionName, Source: "user", Tool: "undo",
@@ -1303,6 +1588,14 @@ func runBash(ctx context.Context, argsJSON string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "bash", "-c", args.Command)
+	// Run bash in its own process group and kill the whole group on
+	// timeout/Ctrl-C: the default kill only reaches bash itself, orphaning
+	// grandchildren like `sleep 1000 | cat` on the target machine (audit 3.3).
+	// frza ships darwin/linux only, so unix process-group calls are fine.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	cmd.Dir = bashWorkDir
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -1327,6 +1620,10 @@ func runBash(ctx context.Context, argsJSON string) (string, error) {
 // --------------------------------------------------------------------------
 // read_file / search / write_file tools
 // --------------------------------------------------------------------------
+
+// toolMaxFileBytes caps how large a file read_file/search will slurp into
+// memory (audit 3.9).
+const toolMaxFileBytes = 64 << 20
 
 func isBinaryData(data []byte) bool {
 	n := len(data)
@@ -1353,6 +1650,12 @@ func runReadFile(ctx context.Context, argsJSON string) (string, error) {
 	}
 	if args.Limit > 2000 {
 		args.Limit = 2000
+	}
+	// Guard against multi-GB logs: the whole file is read into memory, so a
+	// stray read_file on a huge log would OOM the agent (audit 3.9). Point the
+	// model at search/preprocessing instead.
+	if info, err := os.Stat(args.Path); err == nil && info.Size() > toolMaxFileBytes {
+		return fmt.Sprintf("[file too large] %s is %d MB (over the %d MB limit) — use search with a pattern, or bash (head/tail/grep) to preprocess", args.Path, info.Size()>>20, toolMaxFileBytes>>20), nil
 	}
 	data, err := os.ReadFile(args.Path)
 	if err != nil {
@@ -1402,6 +1705,7 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 	const maxResults = 100
 	var results []string
 	truncated := false
+	skippedLarge := 0
 	walkFn := func(p string, d os.DirEntry, err error) error {
 		if err != nil || len(results) >= maxResults {
 			return filepath.SkipAll
@@ -1416,6 +1720,12 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 			if ok, _ := filepath.Match(args.Include, d.Name()); !ok {
 				return nil
 			}
+		}
+		// Files beyond the size cap are slurped whole; skip them instead of
+		// risking an OOM on a stray multi-GB log (audit 3.9)
+		if info, err := d.Info(); err == nil && info.Size() > toolMaxFileBytes {
+			skippedLarge++
+			return nil
 		}
 		data, err := os.ReadFile(p)
 		if err != nil || isBinaryData(data) {
@@ -1438,6 +1748,8 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 	}
 	if info.IsDir() {
 		filepath.WalkDir(args.Path, walkFn)
+	} else if info.Size() > toolMaxFileBytes {
+		return fmt.Sprintf("[file too large] %s is %d MB (over the %d MB limit) — narrow the search with bash grep", args.Path, info.Size()>>20, toolMaxFileBytes>>20), nil
 	} else {
 		// single file: search it directly (skip binary)
 		if data, err := os.ReadFile(args.Path); err == nil && !isBinaryData(data) {
@@ -1456,6 +1768,9 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 		return fmt.Sprintf("(no matches for %q under %s)", args.Pattern, args.Path), nil
 	}
 	out := strings.Join(results, "\n")
+	if skippedLarge > 0 {
+		out += fmt.Sprintf("\n[note: skipped %d files over %d MB]", skippedLarge, toolMaxFileBytes>>20)
+	}
 	if truncated {
 		out += fmt.Sprintf("\n[... truncated at %d matches; narrow the pattern or path ...]", maxResults)
 	}
@@ -1814,6 +2129,10 @@ func init() {
 var ansiCodes = map[string]string{
 	"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "italic": "\033[3m",
 	"red": "\033[31m", "green": "\033[32m",
+	// cyan/yellow are referenced by tool-call banners and context-trim /
+	// round-limit notices; missing keys used to silently render unstyled
+	// (audit 3.4)
+	"cyan": "\033[36m", "yellow": "\033[33m",
 	// 256-color mid-gray: ANSI 90 (bright black) is near-invisible on many
 	// dark terminal themes, especially over SSH on Linux (user report
 	// 2026-09-11). 245 stays de-emphasized but readable on both dark and
@@ -2851,8 +3170,23 @@ func agentToolsOffered() []Tool {
 	}
 }
 
-// alwaysApproved remembers "a" answers for the lifetime of the process.
+// alwaysApproved remembers "a" answers for the current session (cleared on
+// /new). It never covers dangerous commands — those re-ask every time
+// (audit 3.9: one "a" must not silently approve later `rm -rf`-grade calls,
+// and approvals must not leak into a fresh session).
 var alwaysApproved = map[string]bool{}
+
+// alwaysCovers reports whether a remembered "always" answer auto-approves
+// this call at the given risk level.
+func alwaysCovers(toolName string, risk commandRisk) bool {
+	return alwaysApproved[toolName] && risk != riskDangerous
+}
+
+func resetAlwaysApproved() {
+	for k := range alwaysApproved {
+		delete(alwaysApproved, k)
+	}
+}
 
 // Agent tunables; defaults here, overridable via config.json "agent" section
 // (frza config set agent.max_rounds 30). See design §3.7.
@@ -2938,7 +3272,15 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 	var interrupted atomic.Bool
 	go func() {
 		select {
-		case <-sigCh:
+		case sig := <-sigCh:
+			if sig == syscall.SIGTERM {
+				// SIGTERM means the system wants the process gone (shutdown,
+				// systemd stop, CI timeout) — save and exit rather than just
+				// cancelling the in-flight request and returning to the REPL
+				// (audit 3.1).
+				saveSession(session, false)
+				os.Exit(143)
+			}
 			interrupted.Store(true)
 			cancel()
 		case <-ctx.Done():
@@ -3019,6 +3361,18 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 
 		// Execute tool calls sequentially (design §3.7: ordered, dependencies)
 		for _, tc := range res.ToolCalls {
+			if interrupted.Load() {
+				// Ctrl-C landed mid-batch: skip the remaining calls instead of
+				// executing them (audit 3.2 — read_file/search/write_file don't
+				// watch ctx and would otherwise still run, write_file included).
+				// Still record a tool message per call so the tool_call/tool
+				// pairing survives for the next API round.
+				session.Messages = append(session.Messages, Message{
+					Role: "tool", ToolCallID: tc.ID, Name: tc.Name,
+					Content: "[interrupted by user] tool call skipped",
+				})
+				continue
+			}
 			tool, known := agentRegistry[tc.Name]
 			if !known {
 				session.Messages = append(session.Messages, Message{
@@ -3045,7 +3399,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				switch {
 				case risk == riskReadonly:
 					fmt.Println(stylize("  [auto] read-only command", "gray"))
-				case alwaysApproved[tc.Name]:
+				case alwaysCovers(tc.Name, risk):
 					confirmMode = "always"
 					fmt.Println(stylize("  [auto] pre-approved this session", "gray"))
 				default:
@@ -3285,11 +3639,16 @@ func repl(session *Session, apiKey string) {
 						continue
 					}
 				}
+				oldName := session.Name
 				if arg != "" {
 					session.Name = arg
 				}
-				path, _ := saveSession(session, true)
-				fmt.Printf("saved to %s\n", path)
+				if path, ok := saveSession(session, true); ok {
+					fmt.Printf("saved to %s\n", path)
+					migrateSessionArtifacts(oldName, session.Name)
+				} else {
+					session.Name = oldName // save failed: keep the old identity
+				}
 
 			case "/rename":
 				if arg == "" {
@@ -3300,6 +3659,7 @@ func repl(session *Session, apiKey string) {
 				saveSession(session, false) // persist latest content first, then rename as a whole
 				if ok, result := renameSessionFile(oldName, arg); ok {
 					session.Name = arg
+					migrateSessionArtifacts(oldName, arg)
 					fmt.Printf("renamed session %q to %q\n", oldName, arg)
 				} else {
 					fmt.Println(result)
@@ -3358,6 +3718,9 @@ func repl(session *Session, apiKey string) {
 				if newName == "" {
 					newName = defaultSessionName()
 				}
+				// "always" approvals are per-session: don't let them leak into
+				// the fresh session (audit 3.9)
+				resetAlwaysApproved()
 				// Carry base_url over: openai_responses and similar providers
 				// cannot make calls without it
 				session = newSession(newName, provider, session.Model, session.SystemPrompt, session.BaseURL)
@@ -3369,6 +3732,9 @@ func repl(session *Session, apiKey string) {
 					continue
 				}
 				path, overwritten := exportSession(session, arg)
+				if path == "" {
+					continue // error already reported by exportSession
+				}
 				msg := fmt.Sprintf("exported to %s", path)
 				if overwritten {
 					msg += " (overwrote existing file)"
@@ -3658,10 +4024,13 @@ func parseFlags(args []string, names map[string]bool, boolNames map[string]bool)
 			}
 			if len(kv) == 2 {
 				flags[name] = kv[1]
-			} else if i+1 < len(args) {
+			} else if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
 				flags[name] = args[i+1]
 				i++
 			} else {
+				// next token is another flag (or missing): don't swallow it as
+				// the value — `frza --model --agent` must not set model to
+				// "--agent" (audit 3.9)
 				return nil, nil, fmt.Errorf("option --%s requires a value", name)
 			}
 		} else {
@@ -3829,6 +4198,12 @@ func main() {
 }
 
 func cmdConfig(args []string) {
+	if len(args) > 0 && args[0] == "set" {
+		if err := checkConfigIntact(); err != nil {
+			fmt.Println(stylize("[error] "+err.Error(), "red"))
+			os.Exit(1)
+		}
+	}
 	cfg := loadConfig()
 	if len(args) == 0 || args[0] == "show" {
 		var buf bytes.Buffer
@@ -4050,6 +4425,5 @@ func truncateStr(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return cutAtRuneBoundary(s, n) + "..."
 }
-

@@ -86,7 +86,7 @@ func TestResponsesRetryExhausted(t *testing.T) {
 
 	_, err := callOpenAIResponses(context.Background(),
 		[]Message{{Role: "user", Content: "hi"}}, "", "m", "key", srv.URL, nil, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "retries") {
+	if err == nil || !strings.Contains(err.Error(), "after 4 attempts") {
 		t.Errorf("expected exhausted-retry error, got %v", err)
 	}
 	if calls.Load() != int32(len(retryBackoffs)+1) {

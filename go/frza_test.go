@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -46,9 +49,24 @@ func TestClassifyCommand(t *testing.T) {
 		// command substitution cannot be statically graded
 		{"echo $(rm -rf x)", riskUnknown},
 		{"ls `pwd`", riskUnknown},
-		// whitelist write-flag escapes: not auto-run (regression guard)
-		{"sed -i s/a/b/ app.conf", riskReversible},
-		{"sed s/a/b/ app.conf", riskReadonly},
+		// audit A1: &> is a combined stdout+stderr overwrite, not a harmless
+		// discard — only `&> /dev/null` may be stripped
+		{"echo pwned &> /tmp/x", riskDangerous},
+		{"echo ok &> /dev/null", riskReadonly},
+		{"echo ok &>/dev/null", riskReadonly},
+		// audit A2: command wrappers and scriptable editors are not read-only
+		{"ls | xargs mv", riskReversible},
+		{"env mv a b", riskReversible},
+		{"awk 'BEGIN{system(\"ls\")}'", riskReversible},
+		{"sed -n 'w out.txt' in.txt", riskReversible},
+		// audit A3: attached short-option values must not slip past writeFlags
+		{"sort -oout.txt in.txt", riskReversible},
+		// audit A4: process substitution executes commands, cannot be graded
+		{"cat <(mv a b)", riskUnknown},
+		{"diff <(ls a) <(ls b)", riskUnknown},
+		// sed/awk are off the whitelist entirely (audit A2): even plainly
+		// read-only invocations now ask for confirmation
+		{"sed s/a/b/ app.conf", riskReversible},
 		{"find /var/log -name '*.log' -delete", riskReversible},
 		{"find /var/log -name '*.log'", riskReadonly},
 		{"sort -o out.txt in.txt", riskReversible},
@@ -191,6 +209,130 @@ func TestRunBashTimeout(t *testing.T) {
 	out, err = runBash(context.Background(), `{"command":"echo ok","timeout_sec":99999}`)
 	if err != nil || !strings.Contains(out, "ok") {
 		t.Errorf("capped quick command failed: %q %v", out, err)
+	}
+}
+
+// TestGeminiEndpoint (audit B1): the API key must travel in the
+// x-goog-api-key header, never the URL query — *url.Error messages include
+// the full URL and would leak the key into error output.
+func TestGeminiEndpoint(t *testing.T) {
+	url, headers := geminiEndpoint("gemini-2.5-flash", "secret-key-123", "")
+	if strings.Contains(url, "secret-key-123") {
+		t.Errorf("api key present in URL: %s", url)
+	}
+	if headers["x-goog-api-key"] != "secret-key-123" {
+		t.Errorf("x-goog-api-key header missing or wrong: %v", headers)
+	}
+	// custom baseURL replaces the default host (audit 3.7)
+	url, _ = geminiEndpoint("gemini-2.5-flash", "k", "https://gw.internal/gemini/")
+	if url != "https://gw.internal/gemini/models/gemini-2.5-flash:generateContent" {
+		t.Errorf("custom baseURL url = %s", url)
+	}
+}
+
+// TestWriteJSONFileAtomic (audit C1/C3): successful writes produce the target
+// with the requested mode and leave no temp files; failures return an error
+// instead of being silently dropped.
+func TestWriteJSONFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	if err := writeJSONFile(path, map[string]interface{}{"k": "v"}, 0o600); err != nil {
+		t.Fatalf("writeJSONFile: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var got map[string]interface{}
+	if json.Unmarshal(data, &got) != nil || got["k"] != "v" {
+		t.Errorf("round-trip failed: %q", data)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 600", info.Mode().Perm())
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".tmp-*")); len(left) > 0 {
+		t.Errorf("temp files left behind: %v", left)
+	}
+
+	// failure (directory does not exist) must surface an error
+	if err := writeJSONFile(filepath.Join(dir, "nope", "x.json"), map[string]interface{}{}, 0o600); err == nil {
+		t.Errorf("expected error for unwritable path, got nil")
+	}
+}
+
+// TestSaveSessionMode (audit C3): session files hold unredacted conversation
+// and must be 0600 like the journal and config.
+func TestSaveSessionMode(t *testing.T) {
+	tmp := t.TempDir()
+	oldSess := sessDir
+	sessDir = tmp
+	t.Cleanup(func() { sessDir = oldSess })
+
+	s := &Session{Name: "audit-mode", Messages: []Message{{Role: "user", Content: "hi"}}}
+	path, ok := saveSession(s, true)
+	if !ok {
+		t.Fatalf("saveSession failed")
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("session mode = %v (err %v), want 600", info.Mode(), err)
+	}
+}
+
+// TestRenameSessionKeepsOriginalOnFailure (audit C1): when the new file
+// cannot be written, the original session must survive.
+func TestRenameSessionKeepsOriginalOnFailure(t *testing.T) {
+	tmp := t.TempDir()
+	oldSess := sessDir
+	sessDir = tmp
+	t.Cleanup(func() { sessDir = oldSess })
+
+	s := &Session{Name: "old-name", Messages: []Message{{Role: "user", Content: "hi"}}}
+	oldPath, ok := saveSession(s, true)
+	if !ok {
+		t.Fatalf("saveSession failed")
+	}
+	// Make the target path unwritable: a directory already sits there, so the
+	// atomic rename fails.
+	if err := os.Mkdir(sessionPath("new-name"), 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if ok, msg := renameSessionFile("old-name", "new-name"); ok {
+		t.Fatalf("rename unexpectedly succeeded: %s", msg)
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Errorf("original session lost after failed rename: %v", err)
+	}
+}
+
+// TestCheckConfigIntact (audit C2): a corrupted config must be detected and
+// preserved as .bak, so `config set` cannot silently destroy it.
+func TestCheckConfigIntact(t *testing.T) {
+	tmp := t.TempDir()
+	oldCfg := configFile
+	configFile = filepath.Join(tmp, "config.json")
+	t.Cleanup(func() { configFile = oldCfg })
+
+	// missing file: fine (fresh start)
+	if err := checkConfigIntact(); err != nil {
+		t.Errorf("missing config should be OK: %v", err)
+	}
+	// valid JSON: fine
+	os.WriteFile(configFile, []byte(`{"model":"x"}`), 0o600)
+	if err := checkConfigIntact(); err != nil {
+		t.Errorf("valid config should be OK: %v", err)
+	}
+	// corrupted: must error, back up, and preserve the original bytes
+	bad := []byte(`{"model": `)
+	os.WriteFile(configFile, bad, 0o600)
+	if err := checkConfigIntact(); err == nil {
+		t.Fatalf("corrupted config not detected")
+	}
+	bak, err := os.ReadFile(configFile + ".bak")
+	if err != nil || string(bak) != string(bad) {
+		t.Errorf("backup missing or wrong: %q %v", bak, err)
+	}
+	if cur, _ := os.ReadFile(configFile); string(cur) != string(bad) {
+		t.Errorf("original config modified: %q", cur)
 	}
 }
 

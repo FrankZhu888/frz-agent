@@ -468,6 +468,22 @@ func exportSession(s *Session, dest string) (string, bool) {
 
 var errInterrupted = fmt.Errorf("interrupted")
 
+// apiErrorHint maps common HTTP failures to a "how to fix" suggestion
+// (audit A8): the startup key-missing error already guides the user, runtime
+// API errors should too.
+func apiErrorHint(err error) string {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "HTTP 401") || strings.Contains(s, "HTTP 403"):
+		return "authentication failed — check the api key: frza config show (set a fresh one with frza config set --provider <provider> --api-key KEY)"
+	case strings.Contains(s, "HTTP 404"):
+		return "not found — the model name may not exist on this provider (/model), or the base url is wrong (/baseurl)"
+	case strings.Contains(s, "HTTP 429"):
+		return "rate limited — frza retries automatically; if this persists, wait a bit or switch /model"
+	}
+	return ""
+}
+
 func httpPostJSON(ctx context.Context, url string, headers map[string]string, payload interface{}) (map[string]interface{}, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -1567,6 +1583,40 @@ var bashWorkDir, _ = os.Getwd() // captured at process start
 // when the model does not ask for more.
 const bashTimeoutHardCap = 600 * time.Second
 
+// execBash runs a command with a timeout and returns its combined output,
+// untruncated, plus whether the timeout fired. Truncation for model
+// consumption happens in runBash; a user-typed !cmd shows everything
+// (audit A7).
+func execBash(ctx context.Context, command string, timeout time.Duration) (string, bool) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "bash", "-c", command)
+	// Run bash in its own process group and kill the whole group on
+	// timeout/Ctrl-C: the default kill only reaches bash itself, orphaning
+	// grandchildren like `sleep 1000 | cat` on the target machine (audit 3.3).
+	// frza ships darwin/linux only, so unix process-group calls are fine.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.Dir = bashWorkDir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	output := out.String()
+	if cctx.Err() == context.DeadlineExceeded {
+		return output, true
+	}
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			return fmt.Sprintf("%s\n[exit code %d]", output, exit.ExitCode()), false
+		}
+		return output + "\n[error] " + err.Error(), false
+	}
+	return output, false
+}
+
 func runBash(ctx context.Context, argsJSON string) (string, error) {
 	var args struct {
 		Command    string `json:"command"`
@@ -1585,31 +1635,10 @@ func runBash(ctx context.Context, argsJSON string) (string, error) {
 			timeout = 5 * time.Second
 		}
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, "bash", "-c", args.Command)
-	// Run bash in its own process group and kill the whole group on
-	// timeout/Ctrl-C: the default kill only reaches bash itself, orphaning
-	// grandchildren like `sleep 1000 | cat` on the target machine (audit 3.3).
-	// frza ships darwin/linux only, so unix process-group calls are fine.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.Dir = bashWorkDir
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
-	output := truncateToolOutput(out.String(), 200, 50, toolOutputMaxKB*1024)
-	if cctx.Err() == context.DeadlineExceeded {
+	output, timedOut := execBash(ctx, args.Command, timeout)
+	output = truncateToolOutput(output, 200, 50, toolOutputMaxKB*1024)
+	if timedOut {
 		return output + fmt.Sprintf("\n[error] command timed out after %s", timeout), nil
-	}
-	if err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			return fmt.Sprintf("%s\n[exit code %d]", output, exit.ExitCode()), nil
-		}
-		return output + "\n[error] " + err.Error(), nil
 	}
 	if output == "" {
 		return "(no output)", nil
@@ -3029,22 +3058,81 @@ var replCommands = []string{
 	"/journal", "/list", "/model", "/new", "/quit", "/reload-skills", "/rename", "/resume", "/save", "/skills", "/system", "/undo",
 }
 
-type frzCompleter struct{}
-
-// Do implements readline.AutoCompleter: session names after /resume,
-// command names at line start
-func (frzCompleter) Do(line []rune, pos int) ([][]rune, int) {
-	s := string(line[:pos])
-	if strings.HasPrefix(s, "/resume ") || strings.HasPrefix(s, "/resume\t") {
-		idx := strings.LastIndexAny(s, " \t")
-		prefix := s[idx+1:]
-		var out [][]rune
-		for _, e := range listSessions() {
-			if strings.HasPrefix(e.name, prefix) {
-				out = append(out, []rune(e.name[len(prefix):]))
+// suggestCommand finds the closest slash command for an "unknown command"
+// hint (audit A5): an unambiguous prefix wins, otherwise the nearest by
+// edit distance within two typos.
+func suggestCommand(cmd string) string {
+	if len(cmd) >= 3 {
+		for _, c := range replCommands {
+			if strings.HasPrefix(c, cmd) {
+				return c
 			}
 		}
-		return out, len([]rune(prefix))
+	}
+	best, bestDist := "", 3
+	for _, c := range replCommands {
+		if d := editDistance(cmd, c); d < bestDist {
+			best, bestDist = c, d
+		}
+	}
+	return best
+}
+
+// editDistance is the classic Levenshtein distance over runes (command names
+// are short, so the DP table is tiny).
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur := make([]int, len(rb)+1)
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 0
+			if ra[i-1] != rb[j-1] {
+				cost = 1
+			}
+			cur[j] = min3(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(rb)]
+}
+
+func min3(a, b, c int) int {
+	if a < b {
+		if a < c {
+			return a
+		}
+		return c
+	}
+	if b < c {
+		return b
+	}
+	return c
+}
+
+type frzCompleter struct{}
+
+// Do implements readline.AutoCompleter: session names after /resume, /save
+// and /new (the latter two surface existing names so collisions are visible);
+// command names at line start.
+func (frzCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	s := string(line[:pos])
+	for _, c := range []string{"/resume", "/save", "/new"} {
+		if strings.HasPrefix(s, c+" ") || strings.HasPrefix(s, c+"\t") {
+			idx := strings.LastIndexAny(s, " \t")
+			prefix := s[idx+1:]
+			var out [][]rune
+			for _, e := range listSessions() {
+				if strings.HasPrefix(e.name, prefix) {
+					out = append(out, []rune(e.name[len(prefix):]))
+				}
+			}
+			return out, len([]rune(prefix))
+		}
 	}
 	if strings.HasPrefix(s, "/") && !strings.ContainsAny(s, " \t") {
 		var out [][]rune
@@ -3341,6 +3429,9 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 		}
 		if err != nil {
 			fmt.Println(stylize(fmt.Sprintf("\n[error] %v", err), "red"))
+			if hint := apiErrorHint(err); hint != "" {
+				fmt.Println(stylize("  hint: "+hint, "gray"))
+			}
 			if round == 0 {
 				session.Messages = session.Messages[:len(session.Messages)-1] // failed message is not recorded
 			}
@@ -3457,7 +3548,14 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 					}
 				}
 				tStart := time.Now()
+				// Heartbeat while the tool runs: bash can legitimately take
+				// minutes (600s cap), and a silent terminal reads as a hang
+				// (audit A2). No-op on non-tty.
+				toolSpin := newThinkingIndicator()
+				toolSpin.setState("Running " + tc.Name)
+				toolSpin.start()
 				out, rerr := tool.Run(ctx, tc.Arguments)
+				toolSpin.stop()
 				if rerr != nil {
 					out = "[error] " + rerr.Error()
 				}
@@ -3541,19 +3639,29 @@ func repl(session *Session, apiKey string) {
 	fmt.Printf("%s  session %q  provider=%s  model=%s\n", shortVersion(), session.Name, provider, session.Model)
 	if agentMode {
 		fmt.Print("agent mode ON — the model can run tools (read-only auto-runs, changes ask first).\n")
+	} else {
+		// Say it out loud when tools are OFF: a resumed session without
+		// --agent silently degrades to plain chat otherwise (audit A3)
+		fmt.Print(stylize("agent mode OFF — chat only; enable with /agent on or --agent\n", "gray"))
 	}
 	fmt.Print("Type /help for commands, /exit to save and quit.\n\n")
 
+	// Persist readline history across restarts so the up-arrow finds previous
+	// sessions' commands (audit A1). 0600 like the journal: inputs may contain
+	// hostnames, paths, pasted snippets.
+	historyFile := filepath.Join(appDir, "input_history")
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          "> ",
 		AutoComplete:    frzCompleter{},
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
+		HistoryFile:     historyFile,
 	})
 	if err != nil {
 		fmt.Println(stylize("[error] cannot initialize line editing: "+err.Error(), "red"))
 		return
 	}
+	defer os.Chmod(historyFile, 0o600) // runs after rl.Close writes the file
 	defer rl.Close()
 
 	// ask is the confirmation gate for tool execution (y/n/a)
@@ -3595,19 +3703,22 @@ func repl(session *Session, apiKey string) {
 				continue
 			}
 			fmt.Println(stylize("$ "+cmdline, "cyan"))
-			argsJSON, _ := json.Marshal(map[string]string{"command": cmdline})
-			out, rerr := runBash(context.Background(), string(argsJSON))
-			if rerr != nil {
-				out = "[error] " + rerr.Error()
+			// User-typed commands show full output (paged when long); the
+			// model-facing truncation only applies when feeding back via !!
+			// (audit A7)
+			out, timedOut := execBash(context.Background(), cmdline, agentBashTimeout)
+			if timedOut {
+				out += fmt.Sprintf("\n[error] command timed out after %s", agentBashTimeout)
 			}
-			fmt.Println(out)
+			pageText(out)
 			journalWrite(journalEntry{
 				Time: time.Now().Format("2006-01-02T15:04:05"), Session: session.Name,
 				Source: "user", Tool: "bash", Args: cmdline, Confirm: "user-direct",
 				Risk: riskName(classifyCommand(cmdline)), Result: truncateStr(out, 300),
 			})
 			if feed {
-				sendMessage(session, fmt.Sprintf("$ %s\n%s", cmdline, out), provider, apiKey, ask)
+				outForModel := truncateToolOutput(out, 200, 50, toolOutputMaxKB*1024)
+				sendMessage(session, fmt.Sprintf("$ %s\n%s", cmdline, outForModel), provider, apiKey, ask)
 			}
 			continue
 		}
@@ -3772,6 +3883,7 @@ func repl(session *Session, apiKey string) {
 				if arg != "" {
 					session.Model = arg
 					fmt.Printf("model switched to: %s\n", arg)
+					fmt.Println(stylize("note: applies to this session only; persist with frza config set --model "+arg, "gray"))
 				} else {
 					fmt.Printf("current model: %s\n", session.Model)
 				}
@@ -3813,6 +3925,14 @@ func repl(session *Session, apiKey string) {
 				pageText(formatHistory(msgs))
 
 			case "/clear":
+				// One slip wipes the whole investigation context; confirm
+				// first, consistent with the undo/journal safety model (A4)
+				if len(session.Messages) > 0 {
+					if ans := ask(fmt.Sprintf("  clear %d messages? [y/n]: ", len(session.Messages))); ans == "n" {
+						fmt.Println("kept.")
+						continue
+					}
+				}
 				session.Messages = nil
 				fmt.Println("session history cleared.")
 
@@ -3891,7 +4011,11 @@ func repl(session *Session, apiKey string) {
 				}
 
 			default:
-				fmt.Printf("unknown command: %s; type /help for available commands.\n", cmd)
+				if sug := suggestCommand(cmd); sug != "" {
+					fmt.Printf("unknown command: %s; did you mean %s? (type /help for all commands)\n", cmd, sug)
+				} else {
+					fmt.Printf("unknown command: %s; type /help for available commands.\n", cmd)
+				}
 			}
 			continue
 		}
@@ -3955,7 +4079,7 @@ func resolveAPIKey(provider, cliKey string, cfg map[string]interface{}) string {
 }
 
 const helpUsage = `usage: frza [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]
-           [--base-url URL] [--system PROMPT] [--resume NAME]
+           [--base-url URL] [--system PROMPT] [--resume [NAME]]
            [--session-name NAME] [--list-sessions] [--agent] [--version]
            {config,rename,clean} ...
 
@@ -3966,7 +4090,7 @@ options:
   --api-key KEY        API key (can also come from env var or config, see below)
   --base-url URL       custom API base url (required by openai_responses and similar providers)
   --system PROMPT      system prompt
-  --resume NAME        resume the named session
+  --resume [NAME]      resume a session (most recently updated one if NAME omitted)
   --session-name NAME  name for the new session (auto-generated if omitted)
   --list-sessions      list saved sessions and exit
   --agent              start in agent mode (the main event): the model investigates
@@ -4001,7 +4125,7 @@ Models and base urls are stored per provider and never leak across providers.
 Once inside a session, type /help for slash commands (/agent /skills /undo
 /journal /save /resume /export /edit /history etc.); !cmd runs a shell command
 directly, !!cmd also feeds its output to the model; Tab completes commands and
-/resume session names.
+session names after /resume, /save and /new.
 `
 
 // parseFlags parses "--flag value", "--flag=value" and "--boolflag" forms
@@ -4046,7 +4170,7 @@ var mainFlagNames = map[string]bool{
 	"system": true, "resume": true, "session-name": true,
 }
 
-var mainBoolFlags = map[string]bool{"list-sessions": true, "version": true, "agent": true}
+var mainBoolFlags = map[string]bool{"list-sessions": true, "version": true, "agent": true, "resume-latest": true}
 
 // agentMode enables the tool-calling agent loop (--agent, /agent on|off).
 var agentMode bool
@@ -4093,11 +4217,20 @@ func main() {
 		}
 	}
 
+	// Bare `--resume` (no name) means "the most recently updated session",
+	// mirroring the REPL's /resume-without-arg (audit A6). Rewrite it to a
+	// bool flag before parsing so parseFlags doesn't demand a value.
+	for i, a := range args {
+		if a == "--resume" && (i+1 == len(args) || strings.HasPrefix(args[i+1], "--")) {
+			args[i] = "--resume-latest"
+		}
+	}
+
 	flags, _, err := parseFlags(args, mainFlagNames, mainBoolFlags)
 	if err != nil {
 		fmt.Println(err)
 		fmt.Print("usage: frza [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n" +
-			"           [--base-url URL] [--system PROMPT] [--resume NAME]\n" +
+			"           [--base-url URL] [--system PROMPT] [--resume [NAME]]\n" +
 			"           [--session-name NAME] [--list-sessions] [--agent] [--version]\n" +
 			"           {config,rename,clean} ...\n")
 		os.Exit(1)
@@ -4136,10 +4269,21 @@ func main() {
 	}
 
 	var session *Session
-	if name := flags["resume"]; name != "" {
-		session = loadSession(name)
+	resumeName := flags["resume"]
+	if flags["resume-latest"] == "true" {
+		for _, e := range listSessions() { // sorted by mtime, newest first
+			resumeName = e.name
+			break
+		}
+		if resumeName == "" {
+			fmt.Println("[error] no session to resume; start a fresh one instead.")
+			os.Exit(1)
+		}
+	}
+	if resumeName != "" {
+		session = loadSession(resumeName)
 		if session == nil {
-			fmt.Printf("[error] session %q not found; see --list-sessions.\n", name)
+			fmt.Printf("[error] session %q not found; see --list-sessions.\n", resumeName)
 			os.Exit(1)
 		}
 		// The REPL always calls the model with the session's own provider, so the

@@ -52,6 +52,38 @@ Fix: 1) recover disk space … 2) restart containerd/kubelet …
      3) tune kubelet eviction thresholds to prevent recurrence …
 ```
 
+## REPL commands
+
+Everything inside the interactive session (type `/help` to see this list in-app):
+
+| Command | What it does |
+|---|---|
+| `/save [name]` | Save current session (keeps current name if omitted) |
+| `/rename <name>` | Rename current session (journal and backups move along, `/undo` keeps working) |
+| `/resume [name]` | Switch to another session (most recent if omitted) |
+| `/list` | List all saved sessions |
+| `/new [name]` | Start a new session |
+| `/export [file]` | Export conversation to Markdown (default `~/.frza/exports/<session>.md`) |
+| `/system [prompt\|off]` | View, set, or clear the system prompt |
+| `/model [name]` | View or switch model (session-only; persist with `frza config set --model X`) |
+| `/baseurl [url]` | View or set custom API base url |
+| `/agent [on\|off]` | View or toggle agent mode |
+| `/journal` | Operation journal of this session (last 20 entries) |
+| `/undo` | Roll back the most recent file change made by the agent |
+| `/skills` | List loaded skill playbooks |
+| `/reload-skills` | Rescan skill directories without restarting |
+| `/continue` | Keep investigating after the agent round limit |
+| `!cmd` | Run a shell command directly (full output, paged) |
+| `!!cmd` | Run a command and feed its output to the model |
+| `/edit` | Compose a multi-line message in `$VISUAL`/`$EDITOR` (great for pasting logs) |
+| `/history [N]` | Show conversation history (optionally last N rounds, paged) |
+| `/clear` | Clear session history (asks first; keeps system prompt) |
+| `/help` | Show the in-app help |
+| `/exit`, `/quit` | Save and exit |
+
+`frza --resume` without a name resumes the most recently updated session —
+the fastest way back into yesterday's investigation.
+
 ## Safety model
 
 Troubleshooting touches production machines, so the agent is built to be
@@ -132,9 +164,11 @@ outputs are compressed first, then oldest turn groups dropped (tool-call
 pairing preserved). Tunables live in `~/.frza/config.json`:
 
 ```bash
-frza config set agent.max_rounds 30
-frza config set agent.context_max_tokens 512000
-frza config set agent.bash_timeout_sec 300
+frza config set agent.max_rounds 30            # agent loop rounds before /continue prompts (default 15)
+frza config set agent.context_max_tokens 512000 # conversation token budget (default 256000)
+frza config set agent.bash_timeout_sec 300     # default bash timeout, model can ask for up to 600s (default 120)
+frza config set agent.tool_output_max_kb 16    # per-tool-output byte cap fed to the model (default 8)
+frza config set agent.backup_keep_sessions 20  # backup dirs kept before frza clean prunes (default 10)
 ```
 
 ## Building

@@ -347,6 +347,46 @@ func TestSSEIdleTimeout(t *testing.T) {
 	}
 }
 
+// TestSuggestCommand (audit A5): typos and prefixes get a "did you mean" hint.
+func TestSuggestCommand(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/jurnal", "/journal"}, // transposition typo
+		{"/hist", "/history"},   // unambiguous prefix
+		{"/reloa-skills", "/reload-skills"},
+		{"/mode", "/model"},
+		{"/xyz", ""}, // nothing close enough
+	}
+	for _, c := range cases {
+		if got := suggestCommand(c.in); got != c.want {
+			t.Errorf("suggestCommand(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestAPIErrorHint (audit A8): common HTTP failures map to a fix suggestion.
+func TestAPIErrorHint(t *testing.T) {
+	cases := []struct {
+		err  string
+		want string // substring expected in the hint; "" means no hint
+	}{
+		{"HTTP 401: unauthorized", "api key"},
+		{"HTTP 403: forbidden", "api key"},
+		{"HTTP 404: model not found", "/model"},
+		{"HTTP 429: slow down (after 4 attempts)", "rate limited"},
+		{"HTTP 500: boom", ""},
+		{"network error: dial tcp: refused", ""},
+	}
+	for _, c := range cases {
+		got := apiErrorHint(fmt.Errorf("%s", c.err))
+		if c.want == "" && got != "" {
+			t.Errorf("apiErrorHint(%q) = %q, want none", c.err, got)
+		}
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("apiErrorHint(%q) = %q, want substring %q", c.err, got, c.want)
+		}
+	}
+}
+
 // TestReadFileTooLarge (audit 3.9): read_file refuses to slurp a huge file.
 func TestReadFileTooLarge(t *testing.T) {
 	tmp := t.TempDir()

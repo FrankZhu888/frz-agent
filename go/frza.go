@@ -3518,7 +3518,10 @@ func repl(session *Session, apiKey string) {
 					if e.Risk == "dangerous" {
 						mark = stylize("!", "red")
 					}
-					fmt.Printf("%s %s [%s/%s] %s: %s\n", mark, e.Time[11:], e.Source, e.Confirm, e.Tool, truncateStr(e.Args, 100))
+					// full date+time for audit: cross-midnight incidents and
+					// resumed days-old sessions are meaningless with time only
+					ts := strings.Replace(e.Time, "T", " ", 1)
+					fmt.Printf("%s %s [%s/%s] %s: %s\n", mark, ts, e.Source, e.Confirm, e.Tool, truncateStr(e.Args, 80))
 				}
 
 			default:

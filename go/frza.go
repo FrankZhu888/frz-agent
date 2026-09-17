@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -384,6 +385,54 @@ func renameSessionFile(oldName, newName string) (bool, string) {
 	return true, newPath
 }
 
+// copySessionArtifacts duplicates the journal and backup directory to a new
+// session name, leaving the source intact — the right semantics for
+// `/save <new>` (a snapshot: the old session must keep its own undo chain;
+// audit2 M4). Existing targets are never overwritten.
+func copySessionArtifacts(oldName, newName string) {
+	if oldName == "" || newName == "" || oldName == newName {
+		return
+	}
+	oldJ, newJ := journalPath(oldName), journalPath(newName)
+	if data, err := os.ReadFile(oldJ); err == nil {
+		if _, err := os.Stat(newJ); os.IsNotExist(err) {
+			if err := os.WriteFile(newJ, data, 0o600); err != nil {
+				fmt.Println(stylize("[warn] could not copy journal: "+err.Error(), "yellow"))
+			}
+		}
+	}
+	oldB := filepath.Join(backupDir, oldName)
+	if _, err := os.Stat(oldB); err != nil {
+		return
+	}
+	filepath.WalkDir(oldB, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(oldB, p)
+		dst := filepath.Join(backupDir, newName, rel)
+		if d.IsDir() {
+			os.MkdirAll(dst, 0o700)
+			return nil
+		}
+		if _, err := os.Stat(dst); err == nil {
+			return nil // never overwrite
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		if err := os.WriteFile(dst, data, info.Mode().Perm()); err != nil {
+			fmt.Println(stylize("[warn] could not copy backup "+rel+": "+err.Error(), "yellow"))
+		}
+		return nil
+	})
+}
+
 // migrateSessionArtifacts moves the journal and backup directory over to a
 // new session name so /undo keeps working across /rename and /save <new>
 // (audit 3.5). Best-effort: a failed move is reported, never fatal.
@@ -634,6 +683,13 @@ func doWithRetries(ctx context.Context, makeReq func() (*http.Request, error), c
 		if err != nil {
 			if ctx.Err() == context.Canceled {
 				return nil, errInterrupted
+			}
+			// A client-side timeout is not a transient blip: with the sync
+			// client's 5-minute timeout, 4 attempts would mean ~20 minutes
+			// before the user sees an error. Fail fast instead (audit2 M3).
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				return nil, fmt.Errorf("request timed out: %v", err)
 			}
 			failMsg = fmt.Sprintf("network error: %v", err)
 		} else if resp.StatusCode == 429 || resp.StatusCode >= 500 {
@@ -1712,10 +1768,72 @@ var bashWorkDir, _ = os.Getwd() // captured at process start
 // when the model does not ask for more.
 const bashTimeoutHardCap = 600 * time.Second
 
+// boundedWriter bounds how much command output accumulates in memory: it
+// keeps the first headCap and last tailCap bytes, and fires kill exactly once
+// when the total crosses killCap. An infinite producer (`cat /dev/zero`,
+// `yes`, `tail -f`) must not OOM the agent — especially painful on the
+// production machines frza troubleshoots (audit2 §4.1). The token-facing
+// truncation in runBash is a separate, smaller layer.
+type boundedWriter struct {
+	head    bytes.Buffer
+	tail    []byte // ring holding the last tailCap bytes
+	total   int64
+	killCap int64
+	kill    func()
+	killed  bool
+}
+
+const (
+	boundedHeadTail = 128 << 10
+	boundedKillCap  = 4 << 20
+)
+
+func (w *boundedWriter) Write(p []byte) (int, error) {
+	w.total += int64(len(p))
+	if w.total > w.killCap && !w.killed {
+		w.killed = true
+		if w.kill != nil {
+			w.kill()
+		}
+	}
+	n := len(p)
+	if w.head.Len() < boundedHeadTail {
+		fill := boundedHeadTail - w.head.Len()
+		if fill > len(p) {
+			fill = len(p)
+		}
+		w.head.Write(p[:fill])
+		p = p[fill:]
+	}
+	if len(p) > 0 { // head and tail stay disjoint
+		w.tail = append(w.tail, p...)
+		if len(w.tail) > boundedHeadTail {
+			w.tail = append([]byte{}, w.tail[len(w.tail)-boundedHeadTail:]...)
+		}
+	}
+	return n, nil
+}
+
+// String assembles the bounded output with a drop marker when content was
+// omitted in the middle (or the process was killed for flooding).
+func (w *boundedWriter) String() string {
+	dropped := w.total - int64(w.head.Len()) - int64(len(w.tail))
+	if dropped <= 0 {
+		return w.head.String() + string(w.tail)
+	}
+	marker := fmt.Sprintf("\n[... %d bytes of output dropped", dropped)
+	if w.killed {
+		marker += fmt.Sprintf("; process killed after %d bytes ...]", w.killCap)
+	} else {
+		marker += " ...]"
+	}
+	return w.head.String() + marker + string(w.tail)
+}
+
 // execBash runs a command with a timeout and returns its combined output,
-// untruncated, plus whether the timeout fired. Truncation for model
-// consumption happens in runBash; a user-typed !cmd shows everything
-// (audit A7).
+// plus whether the timeout fired. Output is memory-bounded (boundedWriter);
+// token-facing truncation for the model happens in runBash, and a user-typed
+// !cmd pages the (bounded) result (audit A7).
 func execBash(ctx context.Context, command string, timeout time.Duration) (string, bool) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -1728,10 +1846,15 @@ func execBash(ctx context.Context, command string, timeout time.Duration) (strin
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+	// A daemonized grandchild keeps the inherited stdout pipe open after the
+	// group dies; don't let Wait block on it forever (audit2 §4.5).
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = bashWorkDir
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out := &boundedWriter{killCap: boundedKillCap, kill: func() {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}}
+	cmd.Stdout = out
+	cmd.Stderr = out
 	err := cmd.Run()
 	output := out.String()
 	if cctx.Err() == context.DeadlineExceeded {
@@ -1809,6 +1932,12 @@ func runReadFile(ctx context.Context, argsJSON string) (string, error) {
 	if args.Limit > 2000 {
 		args.Limit = 2000
 	}
+	// Only regular files may be slurped: devices, /proc entries and FIFOs
+	// report Size()==0 (slipping past the size cap) and reading a FIFO blocks
+	// forever (audit2 §4.1). Inspect those with bash tools instead.
+	if info, err := os.Stat(args.Path); err == nil && !info.Mode().IsRegular() {
+		return fmt.Sprintf("[not a regular file] %s (device/fifo/socket/proc) — inspect with bash tools (dd, head -c, strings) instead", args.Path), nil
+	}
 	// Guard against multi-GB logs: the whole file is read into memory, so a
 	// stray read_file on a huge log would OOM the agent (audit 3.9). Point the
 	// model at search/preprocessing instead.
@@ -1868,6 +1997,9 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 		if err != nil || len(results) >= maxResults {
 			return filepath.SkipAll
 		}
+		if ctx.Err() != nil { // Ctrl-C must stop the walk (audit2 §4.1)
+			return ctx.Err()
+		}
 		if d.IsDir() {
 			if searchSkipDirs[d.Name()] && p != args.Path {
 				return filepath.SkipDir
@@ -1879,9 +2011,15 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 				return nil
 			}
 		}
+		// Devices/proc entries/FIFOs report Size()==0 and can block forever
+		// on read; only regular files are slurped (audit2 §4.1)
+		info, ierr := d.Info()
+		if ierr != nil || !info.Mode().IsRegular() {
+			return nil
+		}
 		// Files beyond the size cap are slurped whole; skip them instead of
 		// risking an OOM on a stray multi-GB log (audit 3.9)
-		if info, err := d.Info(); err == nil && info.Size() > toolMaxFileBytes {
+		if info.Size() > toolMaxFileBytes {
 			skippedLarge++
 			return nil
 		}
@@ -1905,7 +2043,11 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 		return "", statErr
 	}
 	if info.IsDir() {
-		filepath.WalkDir(args.Path, walkFn)
+		if werr := filepath.WalkDir(args.Path, walkFn); werr != nil && ctx.Err() != nil {
+			return "", errInterrupted
+		}
+	} else if !info.Mode().IsRegular() {
+		return fmt.Sprintf("[not a regular file] %s (device/fifo/socket/proc) — search a directory or use bash tools", args.Path), nil
 	} else if info.Size() > toolMaxFileBytes {
 		return fmt.Sprintf("[file too large] %s is %d MB (over the %d MB limit) — narrow the search with bash grep", args.Path, info.Size()>>20, toolMaxFileBytes>>20), nil
 	} else {
@@ -3976,7 +4118,9 @@ func repl(session *Session, apiKey string) {
 				}
 				if path, ok := saveSession(session, true); ok {
 					fmt.Printf("saved to %s\n", path)
-					migrateSessionArtifacts(oldName, session.Name)
+					// /save snapshots under a new name: copy artifacts so the
+					// old session keeps its own undo chain (audit2 M4)
+					copySessionArtifacts(oldName, session.Name)
 				} else {
 					session.Name = oldName // save failed: keep the old identity
 				}

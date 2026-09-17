@@ -387,6 +387,181 @@ func TestSSEIdleTimeout(t *testing.T) {
 	}
 }
 
+// TestBoundedWriter (audit2 §4.1): output is memory-bounded and the producer
+// is killed once it floods.
+func TestBoundedWriter(t *testing.T) {
+	killed := 0
+	w := &boundedWriter{killCap: boundedKillCap, kill: func() { killed++ }}
+	chunk := make([]byte, 1<<20)
+	for i := range chunk {
+		chunk[i] = 'x'
+	}
+	for i := 0; i < 5; i++ { // 5 MB total, cap is 4 MB
+		n, err := w.Write(chunk)
+		if n != len(chunk) || err != nil {
+			t.Fatalf("Write must consume everything: n=%d err=%v", n, err)
+		}
+	}
+	if killed != 1 {
+		t.Errorf("kill fired %d times, want exactly 1", killed)
+	}
+	if w.head.Len() != boundedHeadTail || len(w.tail) != boundedHeadTail {
+		t.Errorf("head=%d tail=%d, want %d each", w.head.Len(), len(w.tail), boundedHeadTail)
+	}
+	out := w.String()
+	if !strings.Contains(out, "process killed") {
+		t.Errorf("kill marker missing: %.120s", out)
+	}
+
+	// small output: exact passthrough, no marker
+	w2 := &boundedWriter{killCap: boundedKillCap}
+	w2.Write([]byte("hello"))
+	if got := w2.String(); got != "hello" {
+		t.Errorf("small write mangled: %q", got)
+	}
+}
+
+// TestExecBashBoundedOutput (audit2 §4.1): cat /dev/zero no longer OOMs —
+// the producer is killed at the cap and execBash returns promptly.
+func TestExecBashBoundedOutput(t *testing.T) {
+	if _, err := os.Stat("/dev/zero"); err != nil {
+		t.Skip("no /dev/zero")
+	}
+	start := time.Now()
+	out, timedOut := execBash(context.Background(), "cat /dev/zero", 60*time.Second)
+	if timedOut {
+		t.Errorf("should be killed by the output cap, not the timeout")
+	}
+	if d := time.Since(start); d > 15*time.Second {
+		t.Errorf("took too long: %s", d)
+	}
+	if !strings.Contains(out, "process killed") {
+		t.Errorf("kill marker missing: %.120s", out)
+	}
+	if len(out) > 2*boundedHeadTail+4096 {
+		t.Errorf("output not bounded: %d bytes", len(out))
+	}
+}
+
+// TestExecBashWaitDelayOrphan (audit2 §4.5): a background child that outlives
+// bash keeps the inherited stdout pipe open; without WaitDelay, cmd.Wait
+// would block until the orphan exits on its own.
+func TestExecBashWaitDelayOrphan(t *testing.T) {
+	start := time.Now()
+	out, timedOut := execBash(context.Background(), "sleep 30 & echo started", 30*time.Second)
+	if timedOut {
+		t.Errorf("bash exits immediately here; the timeout must not fire")
+	}
+	// bash has already exited; the orphan sleep holds the pipe for 30s, and
+	// WaitDelay (2s) is all that unsticks Wait before then
+	if d := time.Since(start); d > 8*time.Second {
+		t.Errorf("WaitDelay not honored: took %s", d)
+	}
+	if !strings.Contains(out, "started") {
+		t.Errorf("output lost: %q", out)
+	}
+}
+
+// TestReadFileNotRegular (audit2 §4.1): devices/FIFOs are refused.
+func TestReadFileNotRegular(t *testing.T) {
+	out, err := runReadFile(context.Background(), `{"path":"/dev/null"}`)
+	if err != nil {
+		t.Fatalf("runReadFile: %v", err)
+	}
+	if !strings.Contains(out, "not a regular file") {
+		t.Errorf("expected not-a-regular-file guard, got %.80s", out)
+	}
+}
+
+// TestRunSearchSkipsFIFO (audit2 §4.1): search must not block on FIFOs.
+func TestRunSearchSkipsFIFO(t *testing.T) {
+	dir := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(dir, "pipe"), 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello world\n"), 0o644)
+	done := make(chan string, 1)
+	go func() {
+		out, _ := runSearch(context.Background(),
+			fmt.Sprintf(`{"pattern":"hello","path":%q}`, dir))
+		done <- out
+	}()
+	select {
+	case out := <-done:
+		if !strings.Contains(out, "a.txt:1") {
+			t.Errorf("expected match in a.txt: %q", out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Errorf("search hung (likely on the FIFO)")
+	}
+}
+
+// TestSyncClientTimeoutFailsFast (audit2 M3): a client-side timeout must not
+// be retried like a transient blip.
+func TestSyncClientTimeoutFailsFast(t *testing.T) {
+	old := httpClientSync
+	httpClientSync = &http.Client{Timeout: 50 * time.Millisecond}
+	t.Cleanup(func() { httpClientSync = old })
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		time.Sleep(300 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := callAnthropic(context.Background(),
+		[]Message{{Role: "user", Content: "hi"}}, "", "m", "key", srv.URL, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected timeout error, got %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("timeout was retried: calls = %d", calls.Load())
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("not fail-fast: %s", d)
+	}
+}
+
+// TestCopySessionArtifacts (audit2 M4): /save snapshots copy the artifacts;
+// the old session keeps its own undo chain.
+func TestCopySessionArtifacts(t *testing.T) {
+	tmp := t.TempDir()
+	oldJournal, oldBackup := journalDir, backupDir
+	journalDir = filepath.Join(tmp, "journal")
+	backupDir = filepath.Join(tmp, "backups")
+	t.Cleanup(func() { journalDir, backupDir = oldJournal, oldBackup })
+
+	os.MkdirAll(journalDir, 0o700)
+	os.WriteFile(journalPath("old-name"), []byte("{}\n"), 0o600)
+	os.MkdirAll(filepath.Join(backupDir, "old-name"), 0o700)
+	os.WriteFile(filepath.Join(backupDir, "old-name", "0001-x"), []byte("bak"), 0o640)
+
+	copySessionArtifacts("old-name", "new-name")
+
+	// old intact, new present with same content and mode
+	if _, err := os.Stat(journalPath("old-name")); err != nil {
+		t.Errorf("old journal lost: %v", err)
+	}
+	data, err := os.ReadFile(journalPath("new-name"))
+	if err != nil || string(data) != "{}\n" {
+		t.Errorf("journal copy wrong: %q %v", data, err)
+	}
+	info, err := os.Stat(filepath.Join(backupDir, "new-name", "0001-x"))
+	if err != nil || info.Mode().Perm() != 0o640 {
+		t.Errorf("backup copy wrong: %v", err)
+	}
+
+	// never overwrite an existing target
+	os.WriteFile(journalPath("new-name"), []byte("changed\n"), 0o600)
+	copySessionArtifacts("old-name", "new-name")
+	data, _ = os.ReadFile(journalPath("new-name"))
+	if string(data) != "changed\n" {
+		t.Errorf("existing journal overwritten: %q", data)
+	}
+}
+
 // TestSuggestCommand (audit A5): typos and prefixes get a "did you mean" hint.
 func TestSuggestCommand(t *testing.T) {
 	cases := []struct{ in, want string }{

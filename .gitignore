@@ -4,3 +4,5 @@ go/frza-*
 go/checksums.txt
 go/frz-go
 go/dist/
+# local-only audit reports (kept on disk, never committed)
+AUDIT*.md

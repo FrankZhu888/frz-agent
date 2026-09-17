@@ -129,6 +129,9 @@ func TestAlwaysCovers(t *testing.T) {
 	if alwaysCovers("bash", riskDangerous) {
 		t.Errorf("always must NOT cover dangerous commands")
 	}
+	if alwaysCovers("bash", riskUnknown) {
+		t.Errorf("always must NOT cover unknown-risk commands (audit2 §1.2)")
+	}
 	resetAlwaysApproved()
 	if alwaysCovers("bash", riskReversible) {
 		t.Errorf("resetAlwaysApproved did not clear approvals")
@@ -421,6 +424,79 @@ func TestAPIErrorHint(t *testing.T) {
 		if c.want != "" && !strings.Contains(got, c.want) {
 			t.Errorf("apiErrorHint(%q) = %q, want substring %q", c.err, got, c.want)
 		}
+	}
+}
+
+// TestDangerousOnlyFileTargeted (audit2 §2.1): the downgrade gate — a decoy
+// rm must not make a chained systemctl/dd/iptables "reversible".
+func TestDangerousOnlyFileTargeted(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want bool
+	}{
+		{"rm -f /tmp/x", true},
+		{"echo hi > /tmp/x", true},
+		{"rm -f /tmp/decoy && systemctl restart postgres", false},
+		{"rm -f /tmp/decoy; dd if=/dev/zero of=/dev/sdb bs=1M", false},
+		{"rm -f /tmp/decoy; iptables -F", false},
+		{"dd if=/dev/zero of=/dev/sdb", false},
+		{"cat /etc/hosts", true},                    // vacuous: no system pattern (not dangerous anyway)
+		{"echo x &> /dev/null; rm -f /tmp/y", true}, // null-redirect stripped first
+	}
+	for _, c := range cases {
+		if got := dangerousOnlyFileTargeted(c.cmd); got != c.want {
+			t.Errorf("dangerousOnlyFileTargeted(%q) = %v, want %v", c.cmd, got, c.want)
+		}
+	}
+}
+
+// TestSanitizeForDisplay (audit2 §3.1): control characters must not reach
+// the terminal or the journal raw.
+func TestSanitizeForDisplay(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"echo ok", "echo ok"},
+		{"a\rb", `a\rb`},
+		{"\x1b[2Kclear", `\e[2Kclear`},
+		{"line1\nline2", `line1\nline2`},
+		{"\x01\x7f", `\x01\x7f`},
+		{"tab\there", "tab\there"}, // tabs are kept
+	}
+	for _, c := range cases {
+		if got := sanitizeForDisplay(c.in); got != c.want {
+			t.Errorf("sanitizeForDisplay(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestRepairToolCallPairing (audit2 §4.4): a session saved mid tool-batch
+// gets synthetic results so the next API round doesn't 400.
+func TestRepairToolCallPairing(t *testing.T) {
+	broken := []Message{
+		{Role: "user", Content: "q"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "bash"}, {ID: "c2", Name: "bash"}}},
+		{Role: "tool", ToolCallID: "c1", Name: "bash", Content: "ok"},
+		{Role: "user", Content: "next"},
+	}
+	got := repairToolCallPairing(broken)
+	// expect: user, assistant, tool(c1), tool(c2 synthetic), user
+	if len(got) != 5 {
+		t.Fatalf("repaired length = %d, want 5: %#v", len(got), got)
+	}
+	if got[3].ToolCallID != "c2" || got[3].Role != "tool" {
+		t.Errorf("missing synthetic result for c2: %#v", got[3])
+	}
+	if got[4].Role != "user" {
+		t.Errorf("tail shifted wrongly: %#v", got[4])
+	}
+
+	// intact sessions are untouched
+	intact := []Message{
+		{Role: "user", Content: "q"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "bash"}}},
+		{Role: "tool", ToolCallID: "c1", Name: "bash", Content: "ok"},
+	}
+	if got := repairToolCallPairing(intact); len(got) != 3 {
+		t.Errorf("intact session modified: %#v", got)
 	}
 }
 

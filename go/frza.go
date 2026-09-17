@@ -414,7 +414,69 @@ func loadSession(name string) *Session {
 	if json.Unmarshal(data, &s) != nil {
 		return nil
 	}
+	// A session saved mid tool-batch (SIGTERM, crash, OOM kill) can carry an
+	// assistant message whose tool_calls never got results; every subsequent
+	// API round would then 400 on the unmatched function_call (audit2 §4.4).
+	// Repair on load so an interrupted investigation stays resumable.
+	s.Messages = repairToolCallPairing(s.Messages)
 	return &s
+}
+
+// repairToolCallPairing appends a synthetic tool result for any assistant
+// tool_call missing its result, preserving the function_call /
+// function_call_output pairing the Responses API requires (audit2 §4.4).
+func repairToolCallPairing(msgs []Message) []Message {
+	for i := 0; i < len(msgs); i++ {
+		m := msgs[i]
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		have := map[string]bool{}
+		j := i + 1
+		for ; j < len(msgs) && msgs[j].Role == "tool"; j++ {
+			have[msgs[j].ToolCallID] = true
+		}
+		var missing []Message
+		for _, tc := range m.ToolCalls {
+			if !have[tc.ID] {
+				missing = append(missing, Message{
+					Role: "tool", ToolCallID: tc.ID, Name: tc.Name,
+					Content: "[interrupted] tool result missing (session saved mid-batch)",
+				})
+			}
+		}
+		if len(missing) > 0 {
+			tail := append(missing, msgs[j:]...)
+			msgs = append(msgs[:j], tail...)
+			i = j + len(missing) - 1 // continue after the repaired tool block
+		}
+	}
+	return msgs
+}
+
+// sanitizeForDisplay escapes C0 control characters (including \r and ESC) so
+// a hostile command string cannot redraw the line the user is reading or
+// smuggle terminal sequences into the journal (audit2 §3.1). Tabs are kept
+// (common and benign); newlines become visible \n.
+func sanitizeForDisplay(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\033':
+			b.WriteString(`\e`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\t':
+			b.WriteRune(r)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func newSession(name, provider, model, systemPrompt, baseURL string) *Session {
@@ -1006,14 +1068,14 @@ const (
 // no entry here (kept in readonlySubcmds or not read-only).
 var readonlyCmds = map[string]bool{
 	"ls": true, "cat": true, "grep": true, "egrep": true, "fgrep": true, "zgrep": true,
-	"head": true, "tail": true, "less": true, "more": true, "wc": true, "sort": true,
+	"head": true, "tail": true, "more": true, "wc": true, "sort": true,
 	"uniq": true, "cut": true, "tr": true, "diff": true,
 	"find": true, "which": true, "whereis": true, "type": true, "file": true, "stat": true,
 	"df": true, "du": true, "free": true, "top": true, "htop": true, "ps": true,
-	"uptime": true, "uname": true, "hostname": true, "whoami": true, "id": true, "w": true,
-	"date": true, "cal": true, "printenv": true, "echo": true, "printf": true,
+	"uptime": true, "uname": true, "whoami": true, "id": true, "w": true,
+	"cal": true, "printenv": true, "echo": true, "printf": true,
 	"pwd": true, "history": true, "alias": true, "jobs": true,
-	"dmesg": true, "vmstat": true, "iostat": true, "mpstat": true, "pidstat": true,
+	"vmstat": true, "iostat": true, "mpstat": true, "pidstat": true,
 	"ss": true, "netstat": true, "ip": true, "ifconfig": true, "ping": true, "dig": true,
 	"nslookup": true, "host": true, "traceroute": true,
 	"lsof": true, "lsblk": true, "lsmod": true, "lspci": true, "lsusb": true, "lscpu": true,
@@ -1024,6 +1086,10 @@ var readonlyCmds = map[string]bool{
 	// they wrap (`ls | xargs mv`, `env mv a b`), and awk/sed scripts can run
 	// commands (system(), `e` cmd) or write files (`w file`, -i) in ways field
 	// matching cannot detect. They fall through to riskReversible (confirm).
+	//
+	// Also NOT whitelisted (audit2 §1.3): date (-s/positional sets the clock),
+	// hostname (any operand sets it), dmesg (-C destroys the ring buffer,
+	// i.e. incident evidence), less (-o writes a log file).
 }
 
 // readonlySubcmds: read-only only for specific subcommands (checked against the
@@ -1039,15 +1105,23 @@ var readonlySubcmds = map[string][]string{
 	"mount":  {""}, // bare `mount` only
 }
 
-// dangerousPatterns matched against the raw (unsplit) command; any hit
-// escalates the whole chain to riskDangerous.
-var dangerousPatterns = []*regexp.Regexp{
+// dangerousFilePatterns: damage that is file-targeted and therefore undoable
+// from a pre-execution backup (rm operands, > / >> overwrite targets).
+var dangerousFilePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\brm\b`),
+	regexp.MustCompile(`>\s*[^&\s]`), // > file / >> file redirection (overwrite)
+}
+
+// dangerousSystemPatterns: damage no file backup can undo (services, kernel,
+// disks, processes). A dangerous command may only be downgraded to the
+// reversible confirmation tier when NOTHING from this set matches —
+// otherwise `rm -f /tmp/decoy && systemctl restart postgres` would ride the
+// decoy's backup down to auto-approval (audit2 §2.1).
+var dangerousSystemPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\brmdir\b`),
 	regexp.MustCompile(`\bmkfs\b`),
 	regexp.MustCompile(`\bdd\b`),
 	regexp.MustCompile(`\bshred\b`),
-	regexp.MustCompile(`>\s*[^&\s]`), // > file / >> file redirection (overwrite)
 	regexp.MustCompile(`\btruncate\b`),
 	regexp.MustCompile(`\b(kill|pkill|killall)\b`),
 	regexp.MustCompile(`\b(reboot|shutdown|halt|poweroff)\b`),
@@ -1060,9 +1134,29 @@ var dangerousPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\b(swapoff|swapon)\b`),
 }
 
-// splitChain splits a command line on shell chain operators ; && || | while
-// respecting single/double quotes. Best-effort: unmatched quotes degrade to a
-// single segment.
+// dangerousPatterns matched against the raw (unsplit) command; any hit
+// escalates the whole chain to riskDangerous.
+var dangerousPatterns = append(append([]*regexp.Regexp{}, dangerousFilePatterns...), dangerousSystemPatterns...)
+
+// dangerousOnlyFileTargeted reports whether cmd trips ONLY file-targeted
+// dangerous patterns — the sole case where "all targets backed up" may
+// downgrade the confirmation tier (audit2 §2.1). Preprocessed exactly like
+// classifyCommand.
+func dangerousOnlyFileTargeted(cmd string) bool {
+	cmd = nullRedirect.ReplaceAllString(cmd, "")
+	for _, re := range dangerousSystemPatterns {
+		if re.MatchString(cmd) {
+			return false
+		}
+	}
+	return true
+}
+
+// splitChain splits a command line on shell chain operators ; && || | and on
+// newlines — bash -c treats '\n' as a command separator, so a whitelisted
+// first line must not "escort" arbitrary commands after it (audit2 §1.1).
+// Single/double quotes are respected (a newline inside quotes stays put).
+// Best-effort: unmatched quotes degrade to a single segment.
 func splitChain(cmd string) []string {
 	var segs []string
 	var b strings.Builder
@@ -1087,6 +1181,8 @@ func splitChain(cmd string) []string {
 		case '\'', '"':
 			quote = r
 			b.WriteRune(r)
+		case '\n', '\r':
+			flush() // newline is a command separator to bash (audit2 §1.1)
 		case ';', '|':
 			flush()
 			if r == '|' && i+1 < len(runes) && runes[i+1] == '|' {
@@ -1144,7 +1240,18 @@ func firstToken(seg string) string {
 	if len(fields) == 0 {
 		return ""
 	}
-	return filepath.Base(fields[0])
+	name := fields[0]
+	if !strings.ContainsRune(name, '/') {
+		return name // bare name: resolved via PATH at exec time
+	}
+	// An explicit path is trusted only from a system bin dir — otherwise
+	// /tmp/evil/ls inherits ls's read-only status and, combined with
+	// write_file, becomes a persistent approval-free exec path (audit2 §1.4)
+	switch filepath.Dir(name) {
+	case "/bin", "/usr/bin", "/sbin", "/usr/sbin":
+		return filepath.Base(name)
+	}
+	return ""
 }
 
 func nthToken(seg string, n int) string {
@@ -1163,7 +1270,13 @@ var writeFlags = map[string][]string{
 	"sort":       {"-o", "--output"},
 	"journalctl": {"--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync", "--relinquish-var"},
 	"ip":         {"add", "del", "delete", "set", "change", "replace", "flush", "save", "restore"},
-	"ifconfig":   {"up", "down", "add", "delete"},
+	"ifconfig":   {"up", "down", "add", "delete", "mtu", "netmask", "broadcast", "promisc", "hw", "pointopoint", "dstaddr", "txqueuelen"},
+	// audit2 §1.3: whitelisted commands with built-in write/exec forms
+	"git":    {"--output"}, // git diff/log/show --output=F overwrites F
+	"sysctl": {"-w", "--write"},
+	"ss":     {"-K", "--kill"},                                 // destroys sockets in the kernel
+	"tar":    {"-I", "--use-compress-program", "--to-command"}, // runs the program even in list mode
+	"ping":   {"-f"},                                           // flood ping
 }
 
 // isReadonlySegment reports whether a single chain segment is a known
@@ -1179,28 +1292,43 @@ func isReadonlySegment(seg string) bool {
 	}
 	if subs, ok := readonlySubcmds[tok]; ok {
 		sub := nthToken(seg, 1)
+		found := false
 		for _, s := range subs {
 			if s == sub {
-				return true
+				found = true
 			}
 		}
-		return false
-	}
-	if !readonlyCmds[tok] {
+		if !found {
+			return false
+		}
+		// a matching subcommand is read-only only if it also survives the
+		// writeFlags check below — `git diff` lists, but `git diff
+		// --output=F` overwrites F (audit2 §1.3)
+	} else if !readonlyCmds[tok] {
 		return false
 	}
 	// whitelisted command, but a write-capable flag/subcommand revokes it.
 	// Short options match by prefix so attached values can't slip past
-	// (`sort -oout.txt`; audit A3); long options and subcommand words
-	// require an exact or `--flag=value` match.
+	// (`sort -oout.txt`; audit A3). Long options additionally match
+	// unambiguous abbreviations — getopt_long and git accept
+	// `journalctl --vacuum-ti=1d`, `git diff --outp=F` (audit2 §1.3).
 	if bad, ok := writeFlags[tok]; ok {
 		for _, field := range strings.Fields(seg)[1:] {
+			f0 := field // option name without any =value
+			if i := strings.IndexByte(f0, '='); i >= 0 {
+				f0 = f0[:i]
+			}
 			for _, b := range bad {
-				if len(b) >= 2 && b[0] == '-' && b[1] != '-' {
-					if strings.HasPrefix(field, b) {
+				switch {
+				case len(b) >= 2 && b[0] == '-' && b[1] != '-':
+					if strings.HasPrefix(field, b) { // short option
 						return false
 					}
-				} else if field == b || strings.HasPrefix(field, b+"=") {
+				case strings.HasPrefix(b, "--"):
+					if f0 == b || (len(f0) >= 4 && strings.HasPrefix(b, f0)) {
+						return false
+					}
+				case field == b: // subcommand word
 					return false
 				}
 			}
@@ -1218,20 +1346,21 @@ func isReadonlySegment(seg string) bool {
 var nullRedirect = regexp.MustCompile(`\s+(&>+\s*/dev/null|\d*>&\d+|\d*>+\s*/dev/null|>+\s*/dev/null)(\s+2>&1)?`)
 
 // classifyCommand implements the design doc §3.6: split the chain, grade every
-// segment, take the worst. Command substitution $(...)/backticks and process
-// substitution <(...)/>(...) cannot be statically graded -> riskUnknown
-// (audit A4: `cat <(mv a b)` must not auto-run). Dangerous raw patterns
-// escalate.
+// segment, take the worst. Dangerous raw patterns escalate FIRST — a
+// destructive payload wrapped in $(...) must grade dangerous, not slip down
+// to the laxer unknown tier (audit2 §1.2). Remaining command substitution
+// $(...)/backticks and process substitution <(...)/>(...) cannot be
+// statically graded -> riskUnknown (audit A4).
 func classifyCommand(cmd string) commandRisk {
 	cmd = nullRedirect.ReplaceAllString(cmd, "")
-	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") ||
-		strings.Contains(cmd, "<(") || strings.Contains(cmd, ">(") {
-		return riskUnknown
-	}
 	for _, re := range dangerousPatterns {
 		if re.MatchString(cmd) {
 			return riskDangerous
 		}
+	}
+	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") ||
+		strings.Contains(cmd, "<(") || strings.Contains(cmd, ">(") {
+		return riskUnknown
 	}
 	segs := splitChain(cmd)
 	if len(segs) == 0 {
@@ -3266,9 +3395,11 @@ func agentToolsOffered() []Tool {
 var alwaysApproved = map[string]bool{}
 
 // alwaysCovers reports whether a remembered "always" answer auto-approves
-// this call at the given risk level.
+// this call at the given risk level. Dangerous is handled by the tiered
+// gate; unknown (ungradeable: command substitution, opaque syntax) must
+// never be auto-approved at all (audit2 §1.2/§2.2).
 func alwaysCovers(toolName string, risk commandRisk) bool {
-	return alwaysApproved[toolName] && risk != riskDangerous
+	return alwaysApproved[toolName] && risk != riskDangerous && risk != riskUnknown
 }
 
 // alwaysApprovedCmd remembers "a" answers for exact irreversible commands
@@ -3506,6 +3637,29 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 			summary := describeCall(tc)
 			fmt.Println(stylize(fmt.Sprintf("⚙ %s: %s", tc.Name, summary), "cyan"))
 
+			fullCmd := ""
+			if tc.Name == "bash" || tc.Name == "exec" {
+				fullCmd = bashCommandOf(tc)
+			}
+			// The summary is only the first 200 chars — fine for display, but
+			// the human approver must see what the classifier sees (review F1
+			// fixed this for the machine; audit2 §3.1 for the human). Print
+			// the complete, control-char-cleaned command when it exceeds the
+			// summary.
+			if fullCmd != "" && len(fullCmd) > 200 {
+				fmt.Println(stylize(fmt.Sprintf("  full command (%d bytes): %s",
+					len(fullCmd), sanitizeForDisplay(fullCmd)), "cyan"))
+			}
+
+			// The journal is the audit trail: record the full command (cleaned,
+			// secrets redacted by journalWrite), never the 200-char display
+			// summary — otherwise /journal can never reconstruct what actually
+			// ran (audit2 §3.1)
+			journalArgs := summary
+			if fullCmd != "" {
+				journalArgs = sanitizeForDisplay(fullCmd)
+			}
+
 			// ---- confirmation gate (§3.6) ----
 			// Safety decisions (classification, backup extraction) MUST run on
 			// the full untruncated command; summary is display-only (review F1:
@@ -3517,18 +3671,26 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 			var backups []string // pre-confirmation backups of dangerous targets
 			dangerousBackedUp := false
 			if tool.Confirm {
-				fullCmd := ""
-				if tc.Name == "bash" || tc.Name == "exec" {
-					fullCmd = bashCommandOf(tc)
+				if fullCmd != "" {
 					risk = classifyCommand(fullCmd)
+				} else if tc.Name == "write_file" {
+					// write_file is undoable by design (backup on overwrite,
+					// delete-on-create): grade it reversible so "a" can cover
+					// it — riskUnknown must never be auto-approved (§1.2)
+					risk = riskReversible
 				}
-				// Tiered dangerous handling: a dangerous command whose targets
-				// are all safely backed up is effectively reversible, so "a"
-				// covers it like any reversible call. Truly irreversible ones
-				// (no backupable target: dd/kill/systemctl/reboot) fall back
-				// to per-exact-command memory.
+				// Tiered dangerous handling: a dangerous command whose damage
+				// is purely file-targeted (rm / redirection) with every target
+				// safely backed up is effectively reversible, so "a" covers it
+				// like any reversible call. Commands touching anything else
+				// (dd/kill/systemctl/reboot — audit2 §2.1: a decoy rm must not
+				// downgrade a chained systemctl) fall back to per-exact-command
+				// memory.
 				if risk == riskDangerous && fullCmd != "" {
 					backups, dangerousBackedUp = prepareDangerousBackups(session.Name, fullCmd)
+					if dangerousBackedUp && !dangerousOnlyFileTargeted(fullCmd) {
+						dangerousBackedUp = false
+					}
 					for _, b := range backups {
 						fmt.Println(stylize(fmt.Sprintf("  [backup] %s", b), "gray"))
 					}
@@ -3581,7 +3743,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				fmt.Println(stylize("  declined", "gray"))
 				journalWrite(journalEntry{
 					Time: time.Now().Format("2006-01-02T15:04:05"), Session: session.Name,
-					Source: "model", Tool: tc.Name, Args: summary, Confirm: confirmMode,
+					Source: "model", Tool: tc.Name, Args: journalArgs, Confirm: confirmMode,
 					Risk: riskName(risk), Result: "declined by user",
 				})
 			} else {
@@ -3625,7 +3787,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				fmt.Println(stylize(fmt.Sprintf("  → %s", truncateStr(firstLine(result), 160)), "gray"))
 				je := journalEntry{
 					Time: tStart.Format("2006-01-02T15:04:05"), Session: session.Name,
-					Source: "model", Tool: tc.Name, Args: summary, Confirm: confirmMode,
+					Source: "model", Tool: tc.Name, Args: journalArgs, Confirm: confirmMode,
 					Risk: riskName(risk), Result: truncateStr(result, 300),
 				}
 				if len(backups) > 0 {
@@ -3647,7 +3809,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 					if i := strings.Index(b, " -> "); i >= 0 {
 						journalWrite(journalEntry{
 							Time: tStart.Format("2006-01-02T15:04:05"), Session: session.Name,
-							Source: "model", Tool: "backup", Args: tc.Name + ": " + summary,
+							Source: "model", Tool: "backup", Args: tc.Name + ": " + journalArgs,
 							BackupOf: b[:i], BackupTo: b[i+4:], Result: "backup",
 						})
 					}

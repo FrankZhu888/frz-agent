@@ -666,6 +666,92 @@ func TestAutoSaveThrottled(t *testing.T) {
 	}
 }
 
+// TestCredentialPathGuard (audit2 §4.3): credential stores are refused by
+// the read tools; ordinary files pass.
+func TestCredentialPathGuard(t *testing.T) {
+	home := os.Getenv("HOME")
+	blocked := []string{
+		filepath.Join(home, ".ssh", "id_rsa"),
+		"~/.ssh/id_ed25519",
+		filepath.Join(home, ".aws", "credentials"),
+		filepath.Join(home, ".frza", "config.json"),
+		filepath.Join(home, ".netrc"),
+		"/etc/shadow", "/etc/sudoers", "/etc/sudoers.d/wheel",
+		"/tmp/work/app.pem", "/tmp/work/.env", "/tmp/work/.env.production",
+		"/tmp/work/id_rsa_backup", "/tmp/work/kube.kubeconfig",
+	}
+	for _, p := range blocked {
+		if !isCredentialPath(p) {
+			t.Errorf("isCredentialPath(%q) = false, want true", p)
+		}
+	}
+	allowed := []string{
+		"/var/log/syslog", "/etc/nginx/nginx.conf", "/tmp/work/app.log",
+		"/tmp/work/environment.txt", "/tmp/work/keyboard",
+	}
+	for _, p := range allowed {
+		if isCredentialPath(p) {
+			t.Errorf("isCredentialPath(%q) = true, want false", p)
+		}
+	}
+
+	// end-to-end: runReadFile refuses a credential path
+	out, err := runReadFile(context.Background(), `{"path":"/etc/shadow"}`)
+	if err != nil || !strings.Contains(out, "credential path") {
+		t.Errorf("runReadFile(/etc/shadow) = %q %v", out, err)
+	}
+	// runSearch refuses too, and directory walks skip credential files
+	out, _ = runSearch(context.Background(), `{"pattern":"x","path":"/etc/shadow"}`)
+	if !strings.Contains(out, "credential path") {
+		t.Errorf("runSearch(/etc/shadow) = %q", out)
+	}
+}
+
+// TestProtectedWritePath (audit2 §2.2): protected targets force per-call
+// confirmation; ordinary project files don't.
+func TestProtectedWritePath(t *testing.T) {
+	home := os.Getenv("HOME")
+	protected := []string{
+		"/etc/cron.d/backup", "/etc/nginx/nginx.conf", "/boot/vmlinuz",
+		"/var/spool/cron/root", "/etc/systemd/system/x.service",
+		filepath.Join(home, ".ssh", "authorized_keys"),
+		filepath.Join(home, ".bashrc"), filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".frza", "sessions", "x.json"),
+		"/tmp/work/authorized_keys",
+	}
+	for _, p := range protected {
+		if !isProtectedWritePath(p) {
+			t.Errorf("isProtectedWritePath(%q) = false, want true", p)
+		}
+	}
+	open := []string{
+		"/tmp/work/main.go", filepath.Join(home, "src", "fix.patch"),
+		"/var/log/app.log", "/tmp/work/notes.md",
+	}
+	for _, p := range open {
+		if isProtectedWritePath(p) {
+			t.Errorf("isProtectedWritePath(%q) = true, want false", p)
+		}
+	}
+}
+
+// TestLocalSkillNotice (audit2 §4.2): loading project-local skills is never
+// silent.
+func TestLocalSkillNotice(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if got := localSkillNotice(); got != "" {
+		t.Errorf("no skills dir: got %q", got)
+	}
+	os.MkdirAll(filepath.Join(dir, "skills", "k8s"), 0o755)
+	os.WriteFile(filepath.Join(dir, "skills", "k8s", "SKILL.md"), []byte("---\nname: k8s\n---\n"), 0o644)
+	os.MkdirAll(filepath.Join(dir, "skills", "not-a-skill"), 0o755) // no SKILL.md
+	got := localSkillNotice()
+	if !strings.Contains(got, "1 project-local skill") {
+		t.Errorf("notice = %q, want count 1", got)
+	}
+}
+
 // TestSuggestCommand (audit A5): typos and prefixes get a "did you mean" hint.
 func TestSuggestCommand(t *testing.T) {
 	cases := []struct{ in, want string }{

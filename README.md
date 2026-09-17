@@ -133,6 +133,10 @@ description: 定位 K8s 核心组件故障（kubelet/etcd/CNI/CoreDNS…），
 - **Two-level loading**: the catalog (name + description + triggers) goes into
   the system prompt at startup; the model loads the full playbook on demand
   with `use_skill` — 100 playbooks wouldn't cost you context you don't use.
+- **Trust note**: a `skills/` directory in the *current working directory* is
+  also loaded (repo playbooks). Its text enters the system prompt, and frza
+  prints a banner line when that happens — only run frza in directories whose
+  content you trust.
 - **Semantic routing**: describe a symptom in your own words ("pods keep
   restarting") and the model picks the matching playbook; or name it
   explicitly: "用 k8s-analyzer 分析这个日志".

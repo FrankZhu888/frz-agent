@@ -1919,6 +1919,98 @@ func runBash(ctx context.Context, argsJSON string) (string, error) {
 // memory (audit 3.9).
 const toolMaxFileBytes = 64 << 20
 
+// expandHome replaces a leading ~/ with $HOME so path guards can compare
+// absolute forms (audit2 §4.3).
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(os.Getenv("HOME"), path[2:])
+	}
+	return path
+}
+
+// homeDirJoin reports whether p is dir or lives under dir (dir itself
+// counts — searching ~/.ssh directly must be caught too).
+func pathWithin(p, dir string) bool {
+	return p == dir || strings.HasPrefix(p, dir+string(filepath.Separator))
+}
+
+// isCredentialPath reports whether path looks like a credential store that
+// must not be read into the conversation (audit2 §4.3): private keys, cloud
+// credentials, shadow files, frza's own config. The user can always inspect
+// such files themselves with !cmd — that path never enters the model's
+// context unless they explicitly feed it back with !!.
+func isCredentialPath(path string) bool {
+	p := expandHome(path)
+	home := os.Getenv("HOME")
+	if home != "" {
+		for _, dir := range []string{".ssh", ".gnupg", ".aws", ".kube"} {
+			if pathWithin(p, filepath.Join(home, dir)) {
+				return true
+			}
+		}
+		switch p {
+		case filepath.Join(home, ".netrc"),
+			filepath.Join(home, ".docker", "config.json"),
+			filepath.Join(home, ".frza", "config.json"):
+			return true
+		}
+	}
+	switch p {
+	case "/etc/shadow", "/etc/gshadow", "/etc/sudoers":
+		return true
+	}
+	if strings.HasPrefix(p, "/etc/sudoers.d/") {
+		return true
+	}
+	base := filepath.Base(p)
+	switch {
+	case strings.HasPrefix(base, "id_rsa"), strings.HasPrefix(base, "id_ed25519"),
+		strings.HasPrefix(base, "id_ecdsa"), strings.HasPrefix(base, "id_dsa"):
+		return true
+	case base == ".env" || strings.HasPrefix(base, ".env.") || base == "credentials":
+		return true
+	case strings.HasSuffix(base, ".pem"), strings.HasSuffix(base, ".key"),
+		strings.HasSuffix(base, ".p12"), strings.HasSuffix(base, ".pfx"),
+		strings.HasSuffix(base, ".kubeconfig"):
+		return true
+	}
+	return false
+}
+
+// isProtectedWritePath reports whether write_file may only touch path with
+// explicit per-call confirmation (audit2 §2.2): system config, credential
+// dirs, shell rc files, cron, systemd units. These never inherit an
+// "always" approval.
+func isProtectedWritePath(path string) bool {
+	p := expandHome(path)
+	for _, prefix := range []string{"/etc/", "/boot/", "/root/", "/var/spool/cron/"} {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		for _, dir := range []string{".ssh", ".gnupg", ".aws", ".frza"} {
+			if pathWithin(p, filepath.Join(home, dir)) {
+				return true
+			}
+		}
+		switch p {
+		case filepath.Join(home, ".bashrc"), filepath.Join(home, ".zshrc"),
+			filepath.Join(home, ".bash_profile"), filepath.Join(home, ".profile"):
+			return true
+		}
+	}
+	base := filepath.Base(p)
+	if strings.Contains(base, "authorized_keys") {
+		return true
+	}
+	if strings.HasSuffix(base, ".service") &&
+		(strings.HasPrefix(p, "/etc/") || strings.HasPrefix(p, "/lib/") || strings.HasPrefix(p, "/usr/lib/")) {
+		return true
+	}
+	return false
+}
+
 func isBinaryData(data []byte) bool {
 	n := len(data)
 	if n > 512 {
@@ -1944,6 +2036,10 @@ func runReadFile(ctx context.Context, argsJSON string) (string, error) {
 	}
 	if args.Limit > 2000 {
 		args.Limit = 2000
+	}
+	// Credential stores never enter the conversation (audit2 §4.3)
+	if isCredentialPath(args.Path) {
+		return fmt.Sprintf("[credential path] %s looks like a credential store — not read into the conversation; inspect it yourself with !cmd if needed", args.Path), nil
 	}
 	// Only regular files may be slurped: devices, /proc entries and FIFOs
 	// report Size()==0 (slipping past the size cap) and reading a FIFO blocks
@@ -2002,10 +2098,15 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 	if err != nil {
 		re = regexp.MustCompile(regexp.QuoteMeta(args.Pattern)) // fall back to literal
 	}
+	// Credential stores never enter the conversation (audit2 §4.3)
+	if isCredentialPath(args.Path) {
+		return fmt.Sprintf("[credential path] %s looks like a credential store — not searched into the conversation; inspect it yourself with !cmd if needed", args.Path), nil
+	}
 	const maxResults = 100
 	var results []string
 	truncated := false
 	skippedLarge := 0
+	skippedCred := 0
 	walkFn := func(p string, d os.DirEntry, err error) error {
 		if err != nil || len(results) >= maxResults {
 			return filepath.SkipAll
@@ -2028,6 +2129,10 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 		// on read; only regular files are slurped (audit2 §4.1)
 		info, ierr := d.Info()
 		if ierr != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		if isCredentialPath(p) {
+			skippedCred++
 			return nil
 		}
 		// Files beyond the size cap are slurped whole; skip them instead of
@@ -2089,6 +2194,9 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 	out := strings.Join(results, "\n")
 	if skippedLarge > 0 {
 		out += fmt.Sprintf("\n[note: skipped %d files over %d MB]", skippedLarge, toolMaxFileBytes>>20)
+	}
+	if skippedCred > 0 {
+		out += fmt.Sprintf("\n[note: skipped %d credential-looking files]", skippedCred)
 	}
 	if truncated {
 		out += fmt.Sprintf("\n[... truncated at %d matches; narrow the pattern or path ...]", maxResults)
@@ -2198,6 +2306,38 @@ var (
 	skillsCache  []skillInfo
 	skillsLoaded bool
 )
+
+// localSkillNotice reports how many project-local skills the cwd
+// contributes. Their text enters the system prompt, so loading must never
+// be silent (audit2 §4.2 — the default stays on because repo playbooks are
+// an intentional feature; visibility is the mitigation).
+func localSkillNotice() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	alt := filepath.Join(cwd, "skills")
+	if alt == skillsDir {
+		return ""
+	}
+	entries, err := os.ReadDir(alt)
+	if err != nil {
+		return ""
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(alt, e.Name(), "SKILL.md")); err == nil {
+			n++
+		}
+	}
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("loaded %d project-local skill(s) from ./skills — their text enters the system prompt; only run frza in directories you trust", n)
+}
 
 // skillSearchDirs returns skill roots in priority order: user dir first,
 // then a skills/ dir next to the current working directory (repo checkout).
@@ -3848,6 +3988,15 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 					// delete-on-create): grade it reversible so "a" can cover
 					// it — riskUnknown must never be auto-approved (§1.2)
 					risk = riskReversible
+					// ...unless the target is protected: system config,
+					// credential dirs, rc files, cron, systemd units always
+					// ask, every time (audit2 §2.2)
+					var wargs struct {
+						Path string `json:"path"`
+					}
+					if json.Unmarshal([]byte(tc.Arguments), &wargs) == nil && isProtectedWritePath(wargs.Path) {
+						risk = riskDangerous
+					}
 				}
 				// Tiered dangerous handling: a dangerous command whose damage
 				// is purely file-targeted (rm / redirection) with every target
@@ -3875,7 +4024,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				case alwaysCovers(tc.Name, autoRisk):
 					confirmMode = "always"
 					fmt.Println(stylize("  [auto] pre-approved this session", "gray"))
-				case risk == riskDangerous && !dangerousBackedUp && alwaysApprovedCmd[fullCmd]:
+				case risk == riskDangerous && !dangerousBackedUp && fullCmd != "" && alwaysApprovedCmd[fullCmd]:
 					confirmMode = "always"
 					fmt.Println(stylize("  [auto] pre-approved this exact command", "gray"))
 				default:
@@ -3896,7 +4045,11 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 					}
 					confirmMode = ans
 					if ans == "a" {
-						if risk == riskDangerous && !dangerousBackedUp {
+						// fullCmd is empty for non-bash tools (write_file):
+						// their exact-command memory key would be "", which
+						// would then auto-approve EVERY dangerous write_file —
+						// guard both the write and the lookup (audit2 §2.2)
+						if risk == riskDangerous && !dangerousBackedUp && fullCmd != "" {
 							alwaysApprovedCmd[fullCmd] = true
 						} else {
 							alwaysApproved[tc.Name] = true
@@ -3985,8 +4138,11 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 					}
 				}
 			}
+			// Scrub credential shapes before the result enters the
+			// conversation (and thus the session file and the provider):
+			// same rules the journal uses (audit2 §4.3)
 			session.Messages = append(session.Messages, Message{
-				Role: "tool", ToolCallID: tc.ID, Name: tc.Name, Content: result,
+				Role: "tool", ToolCallID: tc.ID, Name: tc.Name, Content: redactSecrets(result),
 			})
 		}
 		// Auto-save every round so an unexpected exit loses nothing
@@ -4048,6 +4204,9 @@ func repl(session *Session, apiKey string) {
 		// Say it out loud when tools are OFF: a resumed session without
 		// --agent silently degrades to plain chat otherwise (audit A3)
 		fmt.Print(stylize("agent mode OFF — chat only; enable with /agent on or --agent\n", "gray"))
+	}
+	if note := localSkillNotice(); note != "" {
+		fmt.Print(stylize(note+"\n", "yellow"))
 	}
 	fmt.Print("Type /help for commands, /exit to save and quit.\n\n")
 

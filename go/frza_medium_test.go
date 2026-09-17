@@ -562,6 +562,110 @@ func TestCopySessionArtifacts(t *testing.T) {
 	}
 }
 
+// TestPasswdPatternBoundary (M6): /etc/passwd as a path is not the passwd
+// command.
+func TestPasswdPatternBoundary(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want commandRisk
+	}{
+		{"cat /etc/passwd", riskReadonly},
+		{"grep root /etc/passwd", riskReadonly},
+		{"passwd", riskDangerous},
+		{"passwd alice", riskDangerous},
+		{"sudo useradd bob", riskDangerous},
+	}
+	for _, c := range cases {
+		if got := classifyCommand(c.cmd); got != c.want {
+			t.Errorf("classifyCommand(%q) = %v, want %v", c.cmd, got, c.want)
+		}
+	}
+}
+
+// TestRedactSecretsMySQLOnly (M7): -p masking is scoped to mysql context and
+// covers the space-separated form.
+func TestRedactSecretsMySQLOnly(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"ssh -p2222 host.example", "ssh -p2222 host.example"}, // not mysql: untouched
+		{"mysql -u root -pSecret123 db", "mysql -u root -p*** db"},
+		{"mysql -p secret123", "mysql -p ***"},
+		{"mysqldump -p hunter2 db", "mysqldump -p ***"},
+	}
+	for _, c := range cases {
+		got := redactSecrets(c.in)
+		if c.in == c.want && got != c.want {
+			t.Errorf("redactSecrets mangled %q -> %q", c.in, got)
+		}
+		if c.in != c.want && !strings.Contains(got, "***") {
+			t.Errorf("redactSecrets(%q) = %q, want masking", c.in, got)
+		}
+		if strings.Contains(got, "Secret123") || strings.Contains(got, "secret123") || strings.Contains(got, "hunter2") {
+			t.Errorf("secret leaked: redactSecrets(%q) = %q", c.in, got)
+		}
+	}
+}
+
+// TestWriteFileMode (M8): files the agent creates are 0600, not 0644.
+func TestWriteFileMode(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "report.txt")
+	if _, err := runWriteFile(context.Background(),
+		fmt.Sprintf(`{"path":%q,"content":"secret data"}`, target)); err != nil {
+		t.Fatalf("runWriteFile: %v", err)
+	}
+	if info, err := os.Stat(target); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v (err %v), want 600", info.Mode(), err)
+	}
+}
+
+// TestRunSearchReadError (M12): an unreadable single file must not report
+// "no matches".
+func TestRunSearchReadError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope", "x.log")
+	if _, err := runSearch(context.Background(),
+		fmt.Sprintf(`{"pattern":"x","path":%q}`, missing)); err == nil {
+		t.Errorf("expected read error, got nil")
+	}
+}
+
+// TestHTTPParseErrorHasContext (M13): a 200 with an HTML body reports the
+// status and a body peek, not a bare "invalid character".
+func TestHTTPParseErrorHasContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "<html><body>Bad Gateway</body></html>")
+	}))
+	defer srv.Close()
+	_, err := callAnthropic(context.Background(),
+		[]Message{{Role: "user", Content: "hi"}}, "", "m", "key", srv.URL, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 200") || !strings.Contains(err.Error(), "<html>") {
+		t.Errorf("error lacks status/body context: %v", err)
+	}
+}
+
+// TestAutoSaveThrottled (M15): auto-save skips saves within the throttle
+// window; forced saves and expired windows go through.
+func TestAutoSaveThrottled(t *testing.T) {
+	tmp := t.TempDir()
+	oldSess := sessDir
+	sessDir = tmp
+	t.Cleanup(func() { sessDir = oldSess })
+	old := lastAutoSave
+	t.Cleanup(func() { lastAutoSave = old })
+
+	s := &Session{Name: "throttle", Messages: []Message{{Role: "user", Content: "hi"}}}
+
+	lastAutoSave = time.Now() // pretend we just saved
+	autoSaveSession(s)
+	if _, err := os.Stat(sessionPath("throttle")); !os.IsNotExist(err) {
+		t.Errorf("throttled auto-save wrote a file")
+	}
+
+	lastAutoSave = time.Now().Add(-3 * time.Second) // window expired
+	autoSaveSession(s)
+	if _, err := os.Stat(sessionPath("throttle")); err != nil {
+		t.Errorf("expired-window auto-save did not write: %v", err)
+	}
+}
+
 // TestSuggestCommand (audit A5): typos and prefixes get a "did you mean" hint.
 func TestSuggestCommand(t *testing.T) {
 	cases := []struct{ in, want string }{

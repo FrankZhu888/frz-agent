@@ -347,6 +347,7 @@ func saveSession(s *Session, force bool) (string, bool) {
 		fmt.Println(stylize("[error] cannot save session: "+err.Error(), "red"))
 		return "", false
 	}
+	lastAutoSave = time.Now() // any successful save resets the throttle (M15)
 	return path, true
 }
 
@@ -617,7 +618,9 @@ func httpPostJSON(ctx context.Context, url string, headers map[string]string, pa
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
+		// include status and a body peek: a 200 carrying an HTML error page
+		// otherwise surfaces as an opaque "invalid character '<'" (M13)
+		return nil, fmt.Errorf("failed to parse response (HTTP %d): %v: %.100s", resp.StatusCode, err, body)
 	}
 	return result, nil
 }
@@ -1184,7 +1187,9 @@ var dangerousSystemPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bsystemctl\s+(stop|restart|disable|mask)\b`),
 	regexp.MustCompile(`\bkubectl\s+(delete|drain|cordon|scale)\b`),
 	regexp.MustCompile(`\b(chmod|chown|chgrp)\s+-R\b`),
-	regexp.MustCompile(`\b(useradd|userdel|passwd)\b`),
+	// word boundary alone would match the path in `cat /etc/passwd` (M6):
+	// require a line start / whitespace / chain operator before the word
+	regexp.MustCompile(`(?:^|[\s;|&])(useradd|userdel|passwd)\b`),
 	regexp.MustCompile(`\b(iptables|nft)\b`),
 	regexp.MustCompile(`\b(fdisk|parted|sgdisk)\b`),
 	regexp.MustCompile(`\b(swapoff|swapon)\b`),
@@ -1565,13 +1570,21 @@ func cutAtRuneBoundary(s string, n int) string {
 
 // redactSecrets masks common credential shapes before anything hits the journal.
 var (
-	secretDashP   = regexp.MustCompile(`(?i)(-p)(\S+)`)
-	secretBearer  = regexp.MustCompile(`(?i)(bearer\s+)(\S+)`)
-	secretKeyword = regexp.MustCompile(`(?i)((?:password|passwd|secret|token|api[_-]?key|authorization)[\w-]*)(["'\s:=]+)(?:bearer\s+)?(\S+)`)
+	secretDashP    = regexp.MustCompile(`(?i)(-p)(\S+)`)
+	secretSpacedP  = regexp.MustCompile(`(?i)(-p)\s+(\S+)`)
+	mysqlContextRe = regexp.MustCompile(`(?i)\bmysql(dump)?\b`)
+	secretBearer   = regexp.MustCompile(`(?i)(bearer\s+)(\S+)`)
+	secretKeyword  = regexp.MustCompile(`(?i)((?:password|passwd|secret|token|api[_-]?key|authorization)[\w-]*)(["'\s:=]+)(?:bearer\s+)?(\S+)`)
 )
 
 func redactSecrets(s string) string {
-	s = secretDashP.ReplaceAllString(s, "${1}***")
+	// -p<password> only inside a mysql/mysqldump invocation (M7): applied
+	// globally it mangles `ssh -p2222`, and `mysql -p secret` (space form) is
+	// a real leak the old rule missed entirely.
+	if mysqlContextRe.MatchString(s) {
+		s = secretDashP.ReplaceAllString(s, "${1}***")
+		s = secretSpacedP.ReplaceAllString(s, "${1} ***")
+	}
 	s = secretBearer.ReplaceAllString(s, "${1}***")
 	s = secretKeyword.ReplaceAllString(s, "${1}${2}***")
 	return s
@@ -2051,8 +2064,14 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 	} else if info.Size() > toolMaxFileBytes {
 		return fmt.Sprintf("[file too large] %s is %d MB (over the %d MB limit) — narrow the search with bash grep", args.Path, info.Size()>>20, toolMaxFileBytes>>20), nil
 	} else {
-		// single file: search it directly (skip binary)
-		if data, err := os.ReadFile(args.Path); err == nil && !isBinaryData(data) {
+		// single file: search it directly (skip binary). A read failure must
+		// not masquerade as "no matches" — the model would conclude the
+		// absence of evidence from missing evidence (M12)
+		data, rerr := os.ReadFile(args.Path)
+		if rerr != nil {
+			return "", fmt.Errorf("cannot read %s: %w", args.Path, rerr)
+		}
+		if !isBinaryData(data) {
 			for i, line := range strings.Split(string(data), "\n") {
 				if re.MatchString(line) {
 					results = append(results, fmt.Sprintf("%s:%d: %s", args.Path, i+1, truncateStr(strings.TrimSpace(line), 200)))
@@ -2094,7 +2113,7 @@ func runWriteFile(ctx context.Context, argsJSON string) (string, error) {
 	if _, err := os.Stat(args.Path); err == nil {
 		existed = true
 	}
-	if err := os.WriteFile(args.Path, []byte(args.Content), 0o644); err != nil {
+	if err := os.WriteFile(args.Path, []byte(args.Content), 0o600); err != nil {
 		return "", err
 	}
 	verb := "created"
@@ -3468,7 +3487,9 @@ func editInEditor() string {
 	if editor == "" {
 		editor = os.Getenv("EDITOR")
 	}
-	if editor == "" {
+	// whitespace-only VISUAL/EDITOR would make the temp file the "program"
+	// (same class of bug as blank PAGER, review F5) — fall back to vi (M14)
+	if strings.TrimSpace(editor) == "" {
 		editor = "vi"
 	}
 	f, err := os.CreateTemp("", "frza-edit-*.md")
@@ -3687,6 +3708,12 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 		systemPrompt = composeAgentSystem(session.SystemPrompt)
 	}
 
+	// apiMessages is the API-bound copy of the conversation: context trimming
+	// applies ONLY to it, never to session.Messages — the session keeps full
+	// history so /history, /export and the audit trail never lose original
+	// tool outputs (audit2 M1).
+	var apiMessages []Message
+
 	callRound := func() (CallResult, error) {
 		indicator := newThinkingIndicator()
 		indicator.start()
@@ -3700,13 +3727,13 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				stream.feed(text)
 			}
 			onReasoning := func(string) { indicator.randomVerb() }
-			res, err = callModel(ctx, provider, session.Messages, systemPrompt,
+			res, err = callModel(ctx, provider, apiMessages, systemPrompt,
 				session.Model, apiKey, session.BaseURL, tools, onDelta, onReasoning)
 			indicator.stop()
 			stream.finish()
 			fmt.Println()
 		} else {
-			res, err = callModel(ctx, provider, session.Messages, systemPrompt,
+			res, err = callModel(ctx, provider, apiMessages, systemPrompt,
 				session.Model, apiKey, session.BaseURL, tools, nil, nil)
 			indicator.stop()
 		}
@@ -3714,13 +3741,14 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 	}
 
 	for round := 0; ; round++ {
-		// Keep the context within budget before each API round (§3.8):
+		// Keep the API-bound copy within budget before each round (§3.8):
 		// compress old tool outputs first, drop oldest turn groups if needed
-		if trimmed, dropped := trimContext(session.Messages, contextMaxTokens); dropped > 0 {
-			session.Messages = trimmed
-			fmt.Println(stylize(fmt.Sprintf("[context] omitted %d oldest rounds to fit the %d-token budget", dropped, contextMaxTokens), "yellow"))
+		apiMessages = append([]Message(nil), session.Messages...)
+		if trimmed, dropped := trimContext(apiMessages, contextMaxTokens); dropped > 0 {
+			apiMessages = trimmed
+			fmt.Println(stylize(fmt.Sprintf("[context] omitted %d oldest rounds from the model's view (full history kept locally) to fit the %d-token budget", dropped, contextMaxTokens), "yellow"))
 		} else {
-			session.Messages = trimmed
+			apiMessages = trimmed
 		}
 		res, err := callRound()
 
@@ -3962,7 +3990,9 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 			})
 		}
 		// Auto-save every round so an unexpected exit loses nothing
-		saveSession(session, false)
+		// (throttled — a full rewrite+fsync every round is wasteful on long
+		// investigations, audit2 M15; the window it opens is ≤2s of history)
+		autoSaveSession(session)
 
 		if interrupted.Load() {
 			fmt.Println(stylize("\n[cancelled] tool execution interrupted", "gray"))
@@ -3973,7 +4003,20 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 			break
 		}
 	}
-	// Auto-save every round so an unexpected exit doesn't lose history
+	// Final save at the end of the turn: never throttled
+	saveSession(session, false)
+}
+
+// lastAutoSave records the last successful auto-save for throttling (M15).
+var lastAutoSave time.Time
+
+// autoSaveSession saves unless the previous save (any kind) happened within
+// the last 2 seconds — rapid tool rounds would otherwise rewrite and fsync
+// the whole session file every round.
+func autoSaveSession(session *Session) {
+	if time.Since(lastAutoSave) < 2*time.Second {
+		return
+	}
 	saveSession(session, false)
 }
 

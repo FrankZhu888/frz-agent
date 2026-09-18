@@ -1683,6 +1683,25 @@ func journalPath(sessionName string) string {
 	return filepath.Join(journalDir, safe+".jsonl")
 }
 
+// formatJournal renders journal entries oldest-first, one per line. The
+// /journal view pages them from the bottom (less +G), so the newest entry is
+// on screen first and the user scrolls up into history.
+func formatJournal(header string, entries []journalEntry) string {
+	var b strings.Builder
+	b.WriteString(header + "\n\n")
+	for _, e := range entries {
+		mark := " "
+		if e.Risk == "dangerous" {
+			mark = stylize("!", "red")
+		}
+		// full date+time for audit: cross-midnight incidents and resumed
+		// days-old sessions are meaningless with time only
+		ts := strings.Replace(e.Time, "T", " ", 1)
+		fmt.Fprintf(&b, "%s %s [%s/%s] %s: %s\n", mark, ts, e.Source, e.Confirm, e.Tool, truncateStr(e.Args, 80))
+	}
+	return b.String()
+}
+
 func journalWrite(e journalEntry) {
 	os.MkdirAll(journalDir, 0o700)
 	e.Args = redactSecrets(truncateStr(e.Args, 500))
@@ -3457,7 +3476,31 @@ func formatHistory(messages []Message) string {
 
 // pageText views long text through a pager ($PAGER, default less -R -F -X);
 // falls back to plain print when not a tty or no pager is available
-func pageText(text string) {
+func pageText(text string)      { pageWith(text, false) }
+func pageTextAtEnd(text string) { pageWith(text, true) }
+
+// pagerArgs assembles the pager command line: less gets -R -F -X, plus +G
+// when the view should open at the end (/journal's newest entry). A
+// whitespace-only PAGER falls back to less (review F5); non-less pagers are
+// invoked as-is (+G is less-specific).
+func pagerArgs(pager string, atEnd bool) []string {
+	parts := strings.Fields(pager)
+	if len(parts) == 0 {
+		parts = []string{"less"}
+	}
+	if filepath.Base(parts[0]) == "less" {
+		parts = append(parts, "-R", "-F", "-X")
+		if atEnd {
+			parts = append(parts, "+G")
+		}
+	}
+	return parts
+}
+
+// pageWith pages text through $PAGER (default less). atEnd opens the pager
+// at the bottom (less +G) — used by /journal, whose newest entries are the
+// natural starting point; the user scrolls up into history.
+func pageWith(text string, atEnd bool) {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		fmt.Println(text)
 		return
@@ -3466,13 +3509,7 @@ func pageText(text string) {
 	if pager == "" {
 		pager = "less"
 	}
-	parts := strings.Fields(pager)
-	if len(parts) == 0 { // whitespace-only PAGER (review F5)
-		parts = []string{"less"}
-	}
-	if filepath.Base(parts[0]) == "less" {
-		parts = append(parts, "-R", "-F", "-X")
-	}
+	parts := pagerArgs(pager, atEnd)
 	cmd := exec.Command(parts[0], parts[1:]...)
 	cmd.Stdin = strings.NewReader(text)
 	cmd.Stdout = os.Stdout
@@ -3596,7 +3633,8 @@ const helpText = `Available commands:
   Agent
     /agent [on|off]      View or toggle agent mode (model can run tools such as
                          bash; read-only commands auto-run, changes ask first)
-    /journal             Show the operation journal of this session (last 20)
+    /journal             Show the operation journal (paged from the newest
+                         entry; scroll up for history, / to search)
     /undo                Roll back the most recent file change made by the agent
     /skills              List available skill playbooks
     /reload-skills       Rescan skill directories (after adding/editing skills)
@@ -4554,27 +4592,17 @@ func repl(session *Session, apiKey string) {
 					fmt.Println("(no journal entries for this session)")
 					continue
 				}
-				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-				const maxShow = 20
-				start := 0
-				if len(lines) > maxShow {
-					start = len(lines) - maxShow
-					fmt.Printf("(showing last %d of %d entries; full log: %s)\n", maxShow, len(lines), journalPath(session.Name))
-				}
-				for _, ln := range lines[start:] {
+				var entries []journalEntry
+				for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 					var e journalEntry
 					if json.Unmarshal([]byte(ln), &e) != nil {
-						continue
+						continue // skip corrupted lines silently, as before
 					}
-					mark := " "
-					if e.Risk == "dangerous" {
-						mark = stylize("!", "red")
-					}
-					// full date+time for audit: cross-midnight incidents and
-					// resumed days-old sessions are meaningless with time only
-					ts := strings.Replace(e.Time, "T", " ", 1)
-					fmt.Printf("%s %s [%s/%s] %s: %s\n", mark, ts, e.Source, e.Confirm, e.Tool, truncateStr(e.Args, 80))
+					entries = append(entries, e)
 				}
+				header := fmt.Sprintf("journal for session %q (%d entries) — newest at bottom; type / to search",
+					session.Name, len(entries))
+				pageTextAtEnd(formatJournal(header, entries))
 
 			default:
 				if sug := suggestCommand(cmd); sug != "" {

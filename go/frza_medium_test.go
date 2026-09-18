@@ -752,6 +752,48 @@ func TestLocalSkillNotice(t *testing.T) {
 	}
 }
 
+// TestPagerArgs: /journal's open-at-end only applies +G to less.
+func TestPagerArgs(t *testing.T) {
+	plain := strings.Join(pagerArgs("less", false), " ")
+	atEnd := strings.Join(pagerArgs("less", true), " ")
+	if strings.Contains(plain, "+G") {
+		t.Errorf("+G without atEnd: %q", plain)
+	}
+	if !strings.Contains(atEnd, "+G") || !strings.Contains(atEnd, "-R") {
+		t.Errorf("atEnd args missing +G: %q", atEnd)
+	}
+	if got := strings.Join(pagerArgs("more", true), " "); strings.Contains(got, "+G") {
+		t.Errorf("+G leaked to non-less pager: %q", got)
+	}
+	if got := pagerArgs("   ", true); filepath.Base(got[0]) != "less" {
+		t.Errorf("whitespace PAGER did not fall back to less: %v", got)
+	}
+}
+
+// TestFormatJournal: all entries render oldest-first with the dangerous mark.
+func TestFormatJournal(t *testing.T) {
+	entries := []journalEntry{
+		{Time: "2026-09-17T10:00:01", Source: "model", Tool: "bash", Args: "ls -la", Confirm: "auto", Risk: "readonly"},
+		{Time: "2026-09-17T10:00:02", Source: "model", Tool: "bash", Args: "rm -f /tmp/x", Confirm: "y", Risk: "dangerous"},
+		{Time: "2026-09-17T10:00:03", Source: "user", Tool: "undo", Args: "restore /tmp/x"},
+	}
+	out := formatJournal("journal for session \"s\" (3 entries)", entries)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	// header + blank + 3 entries
+	if len(lines) != 5 {
+		t.Fatalf("lines = %d, want 5: %q", len(lines), out)
+	}
+	if !strings.Contains(lines[2], "ls -la") || !strings.Contains(lines[3], "rm -f /tmp/x") {
+		t.Errorf("entries out of order or missing: %q", out)
+	}
+	if !strings.Contains(lines[3], "!") {
+		t.Errorf("dangerous entry not marked: %q", lines[3])
+	}
+	if !strings.Contains(lines[2], "2026-09-17 10:00:01") {
+		t.Errorf("timestamp not rendered with space separator: %q", lines[2])
+	}
+}
+
 // TestSuggestCommand (audit A5): typos and prefixes get a "did you mean" hint.
 func TestSuggestCommand(t *testing.T) {
 	cases := []struct{ in, want string }{

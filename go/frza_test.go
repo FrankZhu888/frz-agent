@@ -386,3 +386,27 @@ func TestPaddingEvasion(t *testing.T) {
 	tc := ToolCall{ID: "x", Name: "bash", Arguments: `{"command":"` + payload + `"}`}
 	_ = tc // bashCommandOf coverage lives in the wiring; classify is the gate
 }
+
+func TestFormatJournalSanitizesArgs(t *testing.T) {
+	// non-bash Args (write_file path, describeCall's raw-JSON fallback) are
+	// journaled verbatim; a control char must not forge extra journal lines
+	// or inject terminal escapes into the less -R pager
+	forged := "ok.txt\n 2026-09-17 10:00:03 [model/auto] bash: rm -rf /"
+	out := formatJournal("hdr", []journalEntry{{
+		Time: "2026-09-22T10:00:00", Source: "model", Confirm: "auto",
+		Tool: "write_file", Args: forged,
+	}})
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	// header + blank + exactly one entry line — no forged second entry
+	if len(lines) != 3 {
+		t.Fatalf("forged Args produced %d lines, want 3:\n%s", len(lines), out)
+	}
+	// ESC bytes are escaped too (pager runs less -R)
+	out = formatJournal("hdr", []journalEntry{{
+		Time: "2026-09-22T10:00:00", Source: "model", Confirm: "auto",
+		Tool: "write_file", Args: "a\x1b[2Jb",
+	}})
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("raw ESC survived into journal view: %q", out)
+	}
+}

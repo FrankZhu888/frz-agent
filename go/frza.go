@@ -1697,7 +1697,11 @@ func formatJournal(header string, entries []journalEntry) string {
 		// full date+time for audit: cross-midnight incidents and resumed
 		// days-old sessions are meaningless with time only
 		ts := strings.Replace(e.Time, "T", " ", 1)
-		fmt.Fprintf(&b, "%s %s [%s/%s] %s: %s\n", mark, ts, e.Source, e.Confirm, e.Tool, truncateStr(e.Args, 80))
+		// sanitize at render time too: bash Args were cleaned before writing,
+		// but non-bash Args (write_file path, describeCall's raw-JSON
+		// fallback) go in verbatim — a control char there would forge journal
+		// lines or smuggle escapes into the less -R pager
+		fmt.Fprintf(&b, "%s %s [%s/%s] %s: %s\n", mark, ts, e.Source, e.Confirm, e.Tool, truncateStr(sanitizeForDisplay(e.Args), 80))
 	}
 	return b.String()
 }
@@ -3634,7 +3638,7 @@ const helpText = `Available commands:
     /agent [on|off]      View or toggle agent mode (model can run tools such as
                          bash; read-only commands auto-run, changes ask first)
     /journal             Show the operation journal (paged from the newest
-                         entry; scroll up for history, / to search)
+                         entry; scroll up for history, ? to search)
     /undo                Roll back the most recent file change made by the agent
     /skills              List available skill playbooks
     /reload-skills       Rescan skill directories (after adding/editing skills)
@@ -4600,8 +4604,20 @@ func repl(session *Session, apiKey string) {
 					}
 					entries = append(entries, e)
 				}
-				header := fmt.Sprintf("journal for session %q (%d entries) — newest at bottom; type / to search",
-					session.Name, len(entries))
+				// the pager opens at end-of-file (less +G), so / would search
+				// forward from EOF and find nothing — ? searches backward
+				// through the history above
+				total := len(entries)
+				summary := fmt.Sprintf("%d entries", total)
+				if !term.IsTerminal(int(os.Stdout.Fd())) && total > 20 {
+					// non-tty output can't be paged or scrolled: keep the old
+					// last-20 cap so a piped /journal doesn't dump thousands
+					// of lines into a CI log; the header names the full log
+					entries = entries[total-20:]
+					summary = fmt.Sprintf("showing last 20 of %d entries", total)
+				}
+				header := fmt.Sprintf("journal for session %q (%s) — newest at bottom; type ? to search\nfull log: %s",
+					session.Name, summary, journalPath(session.Name))
 				pageTextAtEnd(formatJournal(header, entries))
 
 			default:

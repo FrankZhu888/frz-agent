@@ -17,8 +17,12 @@ jobs:
         with:
           go-version: "1.27"
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
       - name: Test
-        run: cd go && go vet ./... && go test ./...
+        run: cd go && go vet ./... && go test ./... && python3 -I -m unittest discover -s skill_tests -v
 
       - name: Build release packages (darwin/linux x amd64/arm64 tar.gz + checksums)
         run: cd go && VERSION=${GITHUB_REF_NAME} ./build.sh
@@ -26,5 +30,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: go/dist/${{ github.ref_name }}/frza_${{ github.ref_name }}_*.tar.gz
+          files: |
+            go/dist/${{ github.ref_name }}/frza_${{ github.ref_name }}_*.tar.gz
+            go/dist/${{ github.ref_name }}/checksums.txt
           generate_release_notes: true

@@ -185,7 +185,7 @@ CJK ≈ 1.5 tokens/char) — cost control, not billing.
 | Decision | Rationale |
 |---|---|
 | No SDK / no framework | the Responses protocol is ~200 lines of SSE handling; owning it removes a dependency surface and makes the behavior auditable |
-| Single Go file (~3.7k lines) | everything navigable with grep; split planned only past ~4k lines (tools/agent are natural seams) |
+| Single Go file (~5.6k lines) | everything navigable with grep; the 4k-line split threshold has been reached, with tools/agent/provider/persistence as natural seams |
 | Sequential tool calls | diagnostic steps depend on each other; sequential keeps journal/undo semantics simple and correct |
 | Semantic skill routing | paraphrase-tolerant; code-level keyword matching misses real phrasing |
 | Journal as WAL (not a snapshotter) | filesystem snapshots are heavy; a journaled before-image of *identifiable* targets covers the realistic failure modes at ~1% of the complexity |
@@ -209,5 +209,9 @@ network:
   then empty
 - `redactSecrets`, `truncateToolOutput`, `backupTargetsFor`, frontmatter
   parsing, `responsesInputItems` serialization
+- Embedded Python skills: safe archive extraction, missing-input failures,
+  chronological error selection, bounded samples, and overlapping context
+  merging (`python3 -I -m unittest discover -s skill_tests -v`)
 
-`go test ./...` is the CI gate for every release.
+`go vet`, `gofmt`, `go test ./...`, and the Python skill tests are CI gates for
+every release.

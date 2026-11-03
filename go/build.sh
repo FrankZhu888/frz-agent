@@ -8,7 +8,7 @@
 # Output: dist/frza_<VERSION>_<os>_<arch>.tar.gz (binary + LICENSE) + checksums.txt
 set -e
 
-VERSION=${VERSION:-v0.1.0}
+VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || printf 'dev')}
 BUILD_TIME=$(date +%Y-%m-%d)
 # -s -w strips the symbol table and debug info; -trimpath removes local build paths
 LDFLAGS="-s -w -X main.version=$VERSION -X main.buildTime=$BUILD_TIME"

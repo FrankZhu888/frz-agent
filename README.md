@@ -97,6 +97,11 @@ auditable and recoverable, not just polite:
 | Journal | every operation (including declined ones) is appended to `~/.frza/journal/<session>.jsonl` (mode 0600, secrets redacted) — a full audit trail of what the agent did |
 | Undo | `/undo` rolls back the most recent file change — restores a backup or deletes an agent-created file; works after `/resume` |
 
+The classifier is defense in depth, not a sandbox: frza decodes shell quoting
+before grading, requires confirmation for credential reads and opaque variable
+expansions, and refuses an overwrite when its backup fails. Keep the working
+directory and skill sources trusted.
+
 Two command paths are kept separate: the model can propose commands (through
 the gates above), and *you* can run commands directly with `!cmd` (display
 only) or `!!cmd` (also feed the output to the model) — no confirmation needed
@@ -181,6 +186,7 @@ frza config set agent.backup_keep_sessions 20  # backup dirs kept before frza cl
 cd go
 ./build.sh            # static binaries for darwin/linux × amd64/arm64 + checksums
 go test ./...         # classifier / SSE replay / retry / context / undo suites
+python3 -I -m unittest discover -s skill_tests -v  # embedded log-script regressions
 ```
 
 `CGO_ENABLED=0` static builds: one file, no glibc dependency, runs anywhere

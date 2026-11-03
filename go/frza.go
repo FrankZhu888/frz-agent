@@ -386,6 +386,57 @@ func renameSessionFile(oldName, newName string) (bool, string) {
 	return true, newPath
 }
 
+// rewriteJournalBackupPaths keeps undo metadata aligned with a moved/copied
+// backup directory. JSON objects are used instead of journalEntry so unknown
+// fields from newer versions survive the migration.
+func rewriteJournalBackupPaths(path, oldDir, newDir string) error {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return err
+	}
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var fields map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &fields); err != nil {
+			return fmt.Errorf("parse journal %s: %w", path, err)
+		}
+		if backupTo, ok := fields["backup_to"].(string); ok && pathWithin(backupTo, oldDir) {
+			fields["backup_to"] = newDir + strings.TrimPrefix(backupTo, oldDir)
+			encoded, err := json.Marshal(fields)
+			if err != nil {
+				return err
+			}
+			lines[i] = string(encoded)
+		}
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".journal-migrate-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	content := strings.Join(lines, "\n") + "\n"
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
 // copySessionArtifacts duplicates the journal and backup directory to a new
 // session name, leaving the source intact — the right semantics for
 // `/save <new>` (a snapshot: the old session must keep its own undo chain;
@@ -395,10 +446,13 @@ func copySessionArtifacts(oldName, newName string) {
 		return
 	}
 	oldJ, newJ := journalPath(oldName), journalPath(newName)
+	journalCopied := false
 	if data, err := os.ReadFile(oldJ); err == nil {
 		if _, err := os.Stat(newJ); os.IsNotExist(err) {
 			if err := os.WriteFile(newJ, data, 0o600); err != nil {
 				fmt.Println(stylize("[warn] could not copy journal: "+err.Error(), "yellow"))
+			} else {
+				journalCopied = true
 			}
 		}
 	}
@@ -432,6 +486,11 @@ func copySessionArtifacts(oldName, newName string) {
 		}
 		return nil
 	})
+	if journalCopied {
+		if err := rewriteJournalBackupPaths(newJ, oldB, filepath.Join(backupDir, newName)); err != nil {
+			fmt.Println(stylize("[warn] could not update copied journal backup paths: "+err.Error(), "yellow"))
+		}
+	}
 }
 
 // migrateSessionArtifacts moves the journal and backup directory over to a
@@ -442,15 +501,19 @@ func migrateSessionArtifacts(oldName, newName string) {
 		return
 	}
 	oldJ, newJ := journalPath(oldName), journalPath(newName)
+	oldB, newB := filepath.Join(backupDir, oldName), filepath.Join(backupDir, newName)
+	if _, err := os.Stat(oldB); err == nil {
+		if err := os.Rename(oldB, newB); err != nil {
+			fmt.Println(stylize("[warn] could not migrate backups: "+err.Error(), "yellow"))
+		} else if _, err := os.Stat(oldJ); err == nil {
+			if err := rewriteJournalBackupPaths(oldJ, oldB, newB); err != nil {
+				fmt.Println(stylize("[warn] could not update migrated journal backup paths: "+err.Error(), "yellow"))
+			}
+		}
+	}
 	if _, err := os.Stat(oldJ); err == nil {
 		if err := os.Rename(oldJ, newJ); err != nil {
 			fmt.Println(stylize("[warn] could not migrate journal: "+err.Error(), "yellow"))
-		}
-	}
-	oldB := filepath.Join(backupDir, oldName)
-	if _, err := os.Stat(oldB); err == nil {
-		if err := os.Rename(oldB, filepath.Join(backupDir, newName)); err != nil {
-			fmt.Println(stylize("[warn] could not migrate backups: "+err.Error(), "yellow"))
 		}
 	}
 }
@@ -1132,10 +1195,10 @@ var readonlyCmds = map[string]bool{
 	"find": true, "which": true, "whereis": true, "type": true, "file": true, "stat": true,
 	"df": true, "du": true, "free": true, "top": true, "htop": true, "ps": true,
 	"uptime": true, "uname": true, "whoami": true, "id": true, "w": true,
-	"cal": true, "printenv": true, "echo": true, "printf": true,
+	"cal": true, "echo": true, "printf": true,
 	"pwd": true, "history": true, "alias": true, "jobs": true,
 	"vmstat": true, "iostat": true, "mpstat": true, "pidstat": true,
-	"ss": true, "netstat": true, "ip": true, "ifconfig": true, "ping": true, "dig": true,
+	"ss": true, "netstat": true, "ifconfig": true, "ping": true, "dig": true,
 	"nslookup": true, "host": true, "traceroute": true,
 	"lsof": true, "lsblk": true, "lsmod": true, "lspci": true, "lsusb": true, "lscpu": true,
 	"journalctl": true, "last": true, "lastlog": true, "crash": true,
@@ -1233,8 +1296,25 @@ func splitChain(cmd string) []string {
 		r := runes[i]
 		if quote != 0 {
 			b.WriteRune(r)
+			// In double quotes bash lets backslash escape only these characters.
+			// In particular, \" must not close the quoted region.
+			if quote == '"' && r == '\\' && i+1 < len(runes) && shellDoubleQuoteEscape(runes[i+1]) {
+				i++
+				b.WriteRune(runes[i])
+				continue
+			}
 			if r == quote {
 				quote = 0
+			}
+			continue
+		}
+		// Outside quotes a backslash makes the next character literal. It must
+		// not turn into a quote or a command separator in our lexer either.
+		if r == '\\' {
+			b.WriteRune(r)
+			if i+1 < len(runes) {
+				i++
+				b.WriteRune(runes[i])
 			}
 			continue
 		}
@@ -1262,33 +1342,62 @@ func splitChain(cmd string) []string {
 	return segs
 }
 
-// splitShellFields splits a command segment into fields while respecting
-// single/double quotes — `rm "a b"` yields the single operand `a b`, unlike
-// strings.Fields which would split it in two (audit 3.9). Quotes are stripped
-// from the result. Best-effort, like splitChain.
+func shellDoubleQuoteEscape(r rune) bool {
+	return r == '$' || r == '`' || r == '"' || r == '\\' || r == '\n'
+}
+
+// splitShellFields decodes a command segment using bash-compatible quote and
+// backslash rules. Classification must see the same argv that bash passes to
+// the program: `find . "-delete"` is just as destructive as the unquoted form.
+// Empty quoted fields are preserved; malformed input remains best-effort and
+// will fail closed at a later whitelist check.
 func splitShellFields(seg string) []string {
 	var fields []string
 	var b strings.Builder
 	var quote rune // 0, '\'', or '"'
+	started := false
 	flush := func() {
-		if b.Len() > 0 {
+		if started {
 			fields = append(fields, b.String())
 			b.Reset()
+			started = false
 		}
 	}
-	for _, r := range seg {
+	runes := []rune(seg)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
 		switch {
 		case quote != 0:
+			started = true
 			if r == quote {
 				quote = 0
+				continue
+			}
+			if quote == '"' && r == '\\' && i+1 < len(runes) && shellDoubleQuoteEscape(runes[i+1]) {
+				i++
+				if runes[i] != '\n' { // backslash-newline is a line continuation
+					b.WriteRune(runes[i])
+				}
+				continue
+			}
+			b.WriteRune(r)
+		case r == '\\':
+			started = true
+			if i+1 < len(runes) {
+				i++
+				if runes[i] != '\n' {
+					b.WriteRune(runes[i])
+				}
 			} else {
 				b.WriteRune(r)
 			}
 		case r == '\'' || r == '"':
 			quote = r
+			started = true
 		case r == ' ' || r == '\t':
 			flush()
 		default:
+			started = true
 			b.WriteRune(r)
 		}
 	}
@@ -1297,7 +1406,7 @@ func splitShellFields(seg string) []string {
 }
 
 func firstToken(seg string) string {
-	fields := strings.Fields(seg)
+	fields := splitShellFields(seg)
 	if len(fields) == 0 {
 		return ""
 	}
@@ -1316,7 +1425,7 @@ func firstToken(seg string) string {
 }
 
 func nthToken(seg string, n int) string {
-	fields := strings.Fields(seg)
+	fields := splitShellFields(seg)
 	if len(fields) <= n {
 		return ""
 	}
@@ -1327,17 +1436,38 @@ func nthToken(seg string, n int) string {
 // A whitelisted command carrying any of these is NOT read-only — e.g.
 // `sed -i`, `find -delete`, `sort -o`, `journalctl --vacuum-*`.
 var writeFlags = map[string][]string{
-	"find":       {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf"},
+	"find":       {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf", "-cpio"},
 	"sort":       {"-o", "--output"},
 	"journalctl": {"--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync", "--relinquish-var"},
-	"ip":         {"add", "del", "delete", "set", "change", "replace", "flush", "save", "restore"},
+	"ip":         {"add", "del", "delete", "set", "change", "replace", "flush", "save", "restore"}, // retained for defense in depth; exact allowlist below is authoritative
 	"ifconfig":   {"up", "down", "add", "delete", "mtu", "netmask", "broadcast", "promisc", "hw", "pointopoint", "dstaddr", "txqueuelen"},
 	// audit2 §1.3: whitelisted commands with built-in write/exec forms
 	"git":    {"--output"}, // git diff/log/show --output=F overwrites F
 	"sysctl": {"-w", "--write"},
 	"ss":     {"-K", "--kill"},                                 // destroys sockets in the kernel
-	"tar":    {"-I", "--use-compress-program", "--to-command"}, // runs the program even in list mode
+	"tar":    {"-I", "--use-compress-program", "--to-command", "--checkpoint-action"}, // programs can run even in list mode
 	"ping":   {"-f"},                                           // flood ping
+}
+
+// iproute2 accepts unique prefixes for objects and actions, so a blacklist is
+// unsafe (`ip a f eth0` means `addr flush`). Only exact, explicitly read-only
+// object/action combinations are approved automatically.
+func readonlyIPSegment(fields []string) bool {
+	if len(fields) < 3 { // ip + object + action
+		return false
+	}
+	object, action := fields[1], fields[2]
+	switch object {
+	case "addr", "address", "link", "neigh", "neighbour":
+		return action == "show" || action == "list"
+	case "route":
+		if action == "show" || action == "list" {
+			return true
+		}
+		return action == "get" && len(fields) == 4
+	default:
+		return false
+	}
 }
 
 // isReadonlySegment reports whether a single chain segment is a known
@@ -1351,7 +1481,11 @@ func isReadonlySegment(seg string) bool {
 	if tok == "" {
 		return false
 	}
-	if subs, ok := readonlySubcmds[tok]; ok {
+	if tok == "ip" {
+		if !readonlyIPSegment(splitShellFields(seg)) {
+			return false
+		}
+	} else if subs, ok := readonlySubcmds[tok]; ok {
 		sub := nthToken(seg, 1)
 		found := false
 		for _, s := range subs {
@@ -1374,7 +1508,7 @@ func isReadonlySegment(seg string) bool {
 	// unambiguous abbreviations — getopt_long and git accept
 	// `journalctl --vacuum-ti=1d`, `git diff --outp=F` (audit2 §1.3).
 	if bad, ok := writeFlags[tok]; ok {
-		for _, field := range strings.Fields(seg)[1:] {
+		for _, field := range splitShellFields(seg)[1:] {
 			f0 := field // option name without any =value
 			if i := strings.IndexByte(f0, '='); i >= 0 {
 				f0 = f0[:i]
@@ -1406,6 +1540,67 @@ func isReadonlySegment(seg string) bool {
 // stay visible to the dangerous-pattern scan (audit A1).
 var nullRedirect = regexp.MustCompile(`\s+(&>+\s*/dev/null|\d*>&\d+|\d*>+\s*/dev/null|>+\s*/dev/null)(\s+2>&1)?`)
 
+// shellHasParameterExpansion reports expansions whose value cannot be checked
+// statically. Single-quoted dollar signs and backslash-escaped dollars are
+// literals; double-quoted and unquoted expansions require confirmation when
+// they appear in an otherwise read-only command.
+func shellHasParameterExpansion(seg string) bool {
+	runes := []rune(seg)
+	var quote rune
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if quote == '\'' {
+			if r == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if quote == '"' {
+			if r == '\\' && i+1 < len(runes) && shellDoubleQuoteEscape(runes[i+1]) {
+				i++
+				continue
+			}
+			if r == '"' {
+				quote = 0
+				continue
+			}
+			if r == '$' {
+				return true
+			}
+			continue
+		}
+		if r == '\\' && i+1 < len(runes) {
+			i++
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if r == '$' {
+			return true
+		}
+	}
+	return false
+}
+
+func segmentHasSecretRisk(seg string) bool {
+	if shellHasParameterExpansion(seg) {
+		return true
+	}
+	for _, field := range splitShellFields(seg) {
+		// ~user/.ssh/... requires user-database expansion that we do not
+		// perform; do not silently treat it as an ordinary path.
+		if strings.HasPrefix(field, "~") && field != "~" && !strings.HasPrefix(field, "~/") {
+			return true
+		}
+		if isCredentialPath(field) {
+			return true
+		}
+	}
+	return false
+}
+
 // classifyCommand implements the design doc §3.6: split the chain, grade every
 // segment, take the worst. Dangerous raw patterns escalate FIRST — a
 // destructive payload wrapped in $(...) must grade dangerous, not slip down
@@ -1431,6 +1626,10 @@ func classifyCommand(cmd string) commandRisk {
 		if !isReadonlySegment(seg) {
 			// non-whitelisted but non-dangerous segment: presumably a
 			// reversible change
+			return riskReversible
+		}
+		if segmentHasSecretRisk(seg) {
+			// Read-only does not mean safe to send to a third-party provider.
 			return riskReversible
 		}
 	}
@@ -1573,8 +1772,11 @@ var (
 	secretDashP    = regexp.MustCompile(`(?i)(-p)(\S+)`)
 	secretSpacedP  = regexp.MustCompile(`(?i)(-p)\s+(\S+)`)
 	mysqlContextRe = regexp.MustCompile(`(?i)\bmysql(dump)?\b`)
-	secretBearer   = regexp.MustCompile(`(?i)(bearer\s+)(\S+)`)
-	secretKeyword  = regexp.MustCompile(`(?i)((?:password|passwd|secret|token|api[_-]?key|authorization)[\w-]*)(["'\s:=]+)(?:bearer\s+)?(\S+)`)
+	secretBearer       = regexp.MustCompile(`(?i)(bearer\s+)(\S+)`)
+	secretKeyword      = regexp.MustCompile(`(?i)((?:password|passwd|secret|token|api[_-]?key|authorization|aws_access_key_id)[\w-]*)(["'\s:=]+)(?:bearer\s+)?(\S+)`)
+	secretPrivateKey   = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
+	secretAPIKeysBlock = regexp.MustCompile(`(?is)"api_keys"\s*:\s*\{.*?\}`)
+	secretJSONValue    = regexp.MustCompile(`("[^"]+"\s*:\s*")[^"]*(")`)
 )
 
 func redactSecrets(s string) string {
@@ -1585,7 +1787,13 @@ func redactSecrets(s string) string {
 		s = secretDashP.ReplaceAllString(s, "${1}***")
 		s = secretSpacedP.ReplaceAllString(s, "${1} ***")
 	}
+	s = secretPrivateKey.ReplaceAllString(s, "*** [private key redacted] ***")
 	s = secretBearer.ReplaceAllString(s, "${1}***")
+	// config.json nests provider names below api_keys, so masking only the
+	// outer api_keys token leaves the actual credentials behind.
+	s = secretAPIKeysBlock.ReplaceAllStringFunc(s, func(block string) string {
+		return secretJSONValue.ReplaceAllString(block, "${1}***${2}")
+	})
 	s = secretKeyword.ReplaceAllString(s, "${1}${2}***")
 	return s
 }
@@ -1629,7 +1837,17 @@ func backupFile(sessionName, path string) string {
 		return ""
 	}
 	matches, _ := filepath.Glob(filepath.Join(dir, "*"))
-	dst := filepath.Join(dir, fmt.Sprintf("%04d-%s", len(matches)+1, filepath.Base(path)))
+	maxSeq := 0
+	for _, match := range matches {
+		parts := strings.SplitN(filepath.Base(match), "-", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if seq, err := strconv.Atoi(parts[0]); err == nil && seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	dst := filepath.Join(dir, fmt.Sprintf("%04d-%s", maxSeq+1, filepath.Base(path)))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -1638,6 +1856,30 @@ func backupFile(sessionName, path string) string {
 		return ""
 	}
 	return dst
+}
+
+// prepareWriteBackup resolves a write_file target and creates its before-image.
+// An existing target that cannot be backed up is an error: the caller must not
+// proceed with an unrecoverable overwrite.
+func prepareWriteBackup(sessionName, argsJSON string) (backup, created string, err error) {
+	var args struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal([]byte(argsJSON), &args) != nil || args.Path == "" {
+		return "", "", fmt.Errorf("invalid write_file arguments")
+	}
+	target := canonicalPath(args.Path)
+	if _, statErr := os.Stat(target); statErr == nil {
+		dst := backupFile(sessionName, target)
+		if dst == "" {
+			return "", "", fmt.Errorf("cannot back up %s; refusing to overwrite without an undo point", target)
+		}
+		return target + " -> " + dst, "", nil
+	} else if os.IsNotExist(statErr) {
+		return "", target, nil
+	} else {
+		return "", "", fmt.Errorf("cannot inspect %s before write: %w", target, statErr)
+	}
 }
 
 // rmTargetRe finds file operands of rm (skipping flags and an optional
@@ -1726,11 +1968,28 @@ func journalWrite(e journalEntry) {
 	os.Chmod(p, 0o600)
 }
 
+// resolveJournalBackup also finds backups referenced by pre-migration journals.
+func resolveJournalBackup(sessionName, path string) string {
+	if path == "" {
+		return ""
+	}
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	// Backward compatibility for journals written before rename migration
+	// rewrote backup_to: backup files are flat within the session directory.
+	candidate := filepath.Join(backupDir, sessionName, filepath.Base(path))
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return path
+}
+
 // undoLatest rolls back the most recent restorable operation in the session
 // journal (design §3.6 reverse WAL replay): a backup is restored to its
 // original path, or an agent-created file is deleted. The undo itself is
-// journaled so repeated calls walk backwards through history. Returns a
-// human-readable outcome.
+// journaled so repeated calls walk backwards through history. Legacy relative
+// paths fail closed because their original working directory is unknowable.
 func undoLatest(sessionName string) string {
 	data, err := os.ReadFile(journalPath(sessionName))
 	if err != nil {
@@ -1741,6 +2000,11 @@ func undoLatest(sessionName string) string {
 		var e journalEntry
 		if json.Unmarshal([]byte(ln), &e) == nil {
 			entries = append(entries, e)
+		}
+	}
+	for i := range entries {
+		if entries[i].BackupTo != "" {
+			entries[i].BackupTo = resolveJournalBackup(sessionName, entries[i].BackupTo)
 		}
 	}
 	// paths already rolled back (recorded by previous undo entries)
@@ -1763,6 +2027,9 @@ func undoLatest(sessionName string) string {
 		}
 		switch {
 		case e.BackupTo != "" && !undone[e.BackupTo]:
+			if !filepath.IsAbs(e.BackupOf) || !filepath.IsAbs(e.BackupTo) {
+				return fmt.Sprintf("undo refused: legacy relative paths need manual review (backup_of=%q backup_to=%q)", e.BackupOf, e.BackupTo)
+			}
 			data, err := os.ReadFile(e.BackupTo)
 			if err != nil {
 				return fmt.Sprintf("backup %s missing: %v", e.BackupTo, err)
@@ -1782,6 +2049,9 @@ func undoLatest(sessionName string) string {
 				Args: "restore " + e.BackupOf, BackupTo: e.BackupTo, Result: "ok"})
 			return fmt.Sprintf("undone: restored %s (from %s)", e.BackupOf, e.BackupTo)
 		case e.Created != "" && !undone[e.Created]:
+			if !filepath.IsAbs(e.Created) {
+				return fmt.Sprintf("undo refused: legacy relative created path needs manual review (%q)", e.Created)
+			}
 			if err := os.Remove(e.Created); err != nil {
 				return fmt.Sprintf("delete failed: %v", err)
 			}
@@ -1945,10 +2215,71 @@ const toolMaxFileBytes = 64 << 20
 // expandHome replaces a leading ~/ with $HOME so path guards can compare
 // absolute forms (audit2 §4.3).
 func expandHome(path string) string {
+	if path == "~" {
+		return os.Getenv("HOME")
+	}
 	if strings.HasPrefix(path, "~/") {
 		return filepath.Join(os.Getenv("HOME"), path[2:])
 	}
 	return path
+}
+
+// absoluteCleanPath gives journal entries a stable target independent of the
+// directory from which a session is later resumed. It deliberately does not
+// resolve the final symlink: operations such as rm act on the link itself.
+func absoluteCleanPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	p := expandHome(path)
+	if p == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	return filepath.Clean(abs)
+}
+
+// canonicalPath resolves the target used for file I/O. For a new file, resolve
+// the existing parent so a symlinked directory cannot bypass protected paths.
+func canonicalPath(path string) string {
+	p := absoluteCleanPath(path)
+	if p == "" {
+		return ""
+	}
+	current := p
+	var missing []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return p
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+// pathVariants retains the lexical path as well as the resolved target. This
+// matters on macOS where /etc resolves to /private/etc: checking only the
+// resolved name would accidentally disable the /etc protection rules.
+func pathVariants(path string) []string {
+	p := absoluteCleanPath(path)
+	if p == "" {
+		return nil
+	}
+	resolved := canonicalPath(path)
+	if resolved == p {
+		return []string{p}
+	}
+	return []string{p, resolved}
 }
 
 // homeDirJoin reports whether p is dir or lives under dir (dir itself
@@ -1963,39 +2294,45 @@ func pathWithin(p, dir string) bool {
 // such files themselves with !cmd — that path never enters the model's
 // context unless they explicitly feed it back with !!.
 func isCredentialPath(path string) bool {
-	p := expandHome(path)
-	home := os.Getenv("HOME")
-	if home != "" {
-		for _, dir := range []string{".ssh", ".gnupg", ".aws", ".kube"} {
-			if pathWithin(p, filepath.Join(home, dir)) {
+	paths := pathVariants(path)
+	var homes []string
+	if home := os.Getenv("HOME"); home != "" {
+		homes = pathVariants(home)
+	}
+	for _, p := range paths {
+		for _, home := range homes {
+			for _, dir := range []string{".ssh", ".gnupg", ".aws", ".kube"} {
+				if pathWithin(p, filepath.Join(home, dir)) {
+					return true
+				}
+			}
+			switch p {
+			case filepath.Join(home, ".netrc"),
+				filepath.Join(home, ".docker", "config.json"),
+				filepath.Join(home, ".frza", "config.json"):
 				return true
 			}
 		}
 		switch p {
-		case filepath.Join(home, ".netrc"),
-			filepath.Join(home, ".docker", "config.json"),
-			filepath.Join(home, ".frza", "config.json"):
+		case "/etc/shadow", "/etc/gshadow", "/etc/sudoers",
+			"/private/etc/shadow", "/private/etc/gshadow", "/private/etc/sudoers":
 			return true
 		}
-	}
-	switch p {
-	case "/etc/shadow", "/etc/gshadow", "/etc/sudoers":
-		return true
-	}
-	if strings.HasPrefix(p, "/etc/sudoers.d/") {
-		return true
-	}
-	base := filepath.Base(p)
-	switch {
-	case strings.HasPrefix(base, "id_rsa"), strings.HasPrefix(base, "id_ed25519"),
-		strings.HasPrefix(base, "id_ecdsa"), strings.HasPrefix(base, "id_dsa"):
-		return true
-	case base == ".env" || strings.HasPrefix(base, ".env.") || base == "credentials":
-		return true
-	case strings.HasSuffix(base, ".pem"), strings.HasSuffix(base, ".key"),
-		strings.HasSuffix(base, ".p12"), strings.HasSuffix(base, ".pfx"),
-		strings.HasSuffix(base, ".kubeconfig"):
-		return true
+		if strings.HasPrefix(p, "/etc/sudoers.d/") || strings.HasPrefix(p, "/private/etc/sudoers.d/") {
+			return true
+		}
+		base := filepath.Base(p)
+		switch {
+		case strings.HasPrefix(base, "id_rsa"), strings.HasPrefix(base, "id_ed25519"),
+			strings.HasPrefix(base, "id_ecdsa"), strings.HasPrefix(base, "id_dsa"):
+			return true
+		case base == ".env" || strings.HasPrefix(base, ".env.") || base == "credentials":
+			return true
+		case strings.HasSuffix(base, ".pem"), strings.HasSuffix(base, ".key"),
+			strings.HasSuffix(base, ".p12"), strings.HasSuffix(base, ".pfx"),
+			strings.HasSuffix(base, ".kubeconfig"):
+			return true
+		}
 	}
 	return false
 }
@@ -2005,31 +2342,38 @@ func isCredentialPath(path string) bool {
 // dirs, shell rc files, cron, systemd units. These never inherit an
 // "always" approval.
 func isProtectedWritePath(path string) bool {
-	p := expandHome(path)
-	for _, prefix := range []string{"/etc/", "/boot/", "/root/", "/var/spool/cron/"} {
-		if strings.HasPrefix(p, prefix) {
-			return true
-		}
-	}
+	paths := pathVariants(path)
+	var homes []string
 	if home := os.Getenv("HOME"); home != "" {
-		for _, dir := range []string{".ssh", ".gnupg", ".aws", ".frza"} {
-			if pathWithin(p, filepath.Join(home, dir)) {
+		homes = pathVariants(home)
+	}
+	for _, p := range paths {
+		for _, prefix := range []string{"/etc/", "/private/etc/", "/boot/", "/root/", "/var/spool/cron/"} {
+			if strings.HasPrefix(p, prefix) {
 				return true
 			}
 		}
-		switch p {
-		case filepath.Join(home, ".bashrc"), filepath.Join(home, ".zshrc"),
-			filepath.Join(home, ".bash_profile"), filepath.Join(home, ".profile"):
+		for _, home := range homes {
+			for _, dir := range []string{".ssh", ".gnupg", ".aws", ".frza"} {
+				if pathWithin(p, filepath.Join(home, dir)) {
+					return true
+				}
+			}
+			switch p {
+			case filepath.Join(home, ".bashrc"), filepath.Join(home, ".zshrc"),
+				filepath.Join(home, ".bash_profile"), filepath.Join(home, ".profile"):
+				return true
+			}
+		}
+		base := filepath.Base(p)
+		if strings.Contains(base, "authorized_keys") {
 			return true
 		}
-	}
-	base := filepath.Base(p)
-	if strings.Contains(base, "authorized_keys") {
-		return true
-	}
-	if strings.HasSuffix(base, ".service") &&
-		(strings.HasPrefix(p, "/etc/") || strings.HasPrefix(p, "/lib/") || strings.HasPrefix(p, "/usr/lib/")) {
-		return true
+		if strings.HasSuffix(base, ".service") &&
+			(strings.HasPrefix(p, "/etc/") || strings.HasPrefix(p, "/private/etc/") ||
+				strings.HasPrefix(p, "/lib/") || strings.HasPrefix(p, "/usr/lib/")) {
+			return true
+		}
 	}
 	return false
 }
@@ -2064,6 +2408,7 @@ func runReadFile(ctx context.Context, argsJSON string) (string, error) {
 	if isCredentialPath(args.Path) {
 		return fmt.Sprintf("[credential path] %s looks like a credential store — not read into the conversation; inspect it yourself with !cmd if needed", args.Path), nil
 	}
+	args.Path = canonicalPath(args.Path)
 	// Only regular files may be slurped: devices, /proc entries and FIFOs
 	// report Size()==0 (slipping past the size cap) and reading a FIFO blocks
 	// forever (audit2 §4.1). Inspect those with bash tools instead.
@@ -2125,6 +2470,7 @@ func runSearch(ctx context.Context, argsJSON string) (string, error) {
 	if isCredentialPath(args.Path) {
 		return fmt.Sprintf("[credential path] %s looks like a credential store — not searched into the conversation; inspect it yourself with !cmd if needed", args.Path), nil
 	}
+	args.Path = canonicalPath(args.Path)
 	const maxResults = 100
 	var results []string
 	truncated := false
@@ -2235,6 +2581,7 @@ func runWriteFile(ctx context.Context, argsJSON string) (string, error) {
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || args.Path == "" {
 		return "", fmt.Errorf("invalid arguments: need {\"path\": \"...\", \"content\": \"...\"}")
 	}
+	args.Path = canonicalPath(args.Path)
 	if dir := filepath.Dir(args.Path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", err
@@ -3743,8 +4090,25 @@ var alwaysApproved = map[string]bool{}
 // this call at the given risk level. Dangerous is handled by the tiered
 // gate; unknown (ungradeable: command substitution, opaque syntax) must
 // never be auto-approved at all (audit2 §1.2/§2.2).
-func alwaysCovers(toolName string, risk commandRisk) bool {
-	return alwaysApproved[toolName] && risk != riskDangerous && risk != riskUnknown
+func approvalKey(toolName, fullCmd string) string {
+	if (toolName == "bash" || toolName == "exec") && fullCmd != "" {
+		if segs := splitChain(fullCmd); len(segs) == 1 {
+			if command := firstToken(segs[0]); command != "" {
+				return toolName + ":" + command
+			}
+		}
+		// Chains and opaque commands never inherit a broad tool approval.
+		return toolName + ":exact:" + fullCmd
+	}
+	return toolName
+}
+
+func alwaysCovers(toolName string, risk commandRisk, fullCmd ...string) bool {
+	cmd := ""
+	if len(fullCmd) > 0 {
+		cmd = fullCmd[0]
+	}
+	return alwaysApproved[approvalKey(toolName, cmd)] && risk != riskDangerous && risk != riskUnknown
 }
 
 // alwaysApprovedCmd remembers "a" answers for exact irreversible commands
@@ -3774,6 +4138,7 @@ func prepareDangerousBackups(sessionName, fullCmd string) (backups []string, all
 	}
 	all := true
 	for _, target := range targets {
+		target = absoluteCleanPath(target)
 		if dst := backupFile(sessionName, target); dst != "" {
 			backups = append(backups, target+" -> "+dst)
 		} else {
@@ -4063,7 +4428,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				switch {
 				case risk == riskReadonly:
 					fmt.Println(stylize("  [auto] read-only command", "gray"))
-				case alwaysCovers(tc.Name, autoRisk):
+				case alwaysCovers(tc.Name, autoRisk, fullCmd):
 					confirmMode = "always"
 					fmt.Println(stylize("  [auto] pre-approved this session", "gray"))
 				case risk == riskDangerous && !dangerousBackedUp && fullCmd != "" && alwaysApprovedCmd[fullCmd]:
@@ -4094,7 +4459,7 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 						if risk == riskDangerous && !dangerousBackedUp && fullCmd != "" {
 							alwaysApprovedCmd[fullCmd] = true
 						} else {
-							alwaysApproved[tc.Name] = true
+							alwaysApproved[approvalKey(tc.Name, fullCmd)] = true
 						}
 					} else if ans != "y" {
 						approved = false
@@ -4116,31 +4481,30 @@ func sendMessage(session *Session, userInput, provider, apiKey string, ask confi
 				// confirmation gate (before the user answered). write_file
 				// backs up here (overwrite) or marks creation for undo.
 				var writeNewPath string // write_file creating a new file (undo = delete)
+				var writeBackupErr error
 				if tc.Name == "write_file" {
-					// Overwriting: back up the original; creating: undo = delete
-					var wargs struct {
-						Path string `json:"path"`
-					}
-					if json.Unmarshal([]byte(tc.Arguments), &wargs) == nil && wargs.Path != "" {
-						if _, err := os.Stat(wargs.Path); err == nil {
-							if dst := backupFile(session.Name, wargs.Path); dst != "" {
-								backups = append(backups, wargs.Path+" -> "+dst)
-								fmt.Println(stylize(fmt.Sprintf("  [backup] %s -> %s", wargs.Path, dst), "gray"))
-							}
-						} else {
-							writeNewPath = wargs.Path
-						}
+					backup, created, err := prepareWriteBackup(session.Name, tc.Arguments)
+					writeNewPath, writeBackupErr = created, err
+					if backup != "" {
+						backups = append(backups, backup)
+						fmt.Println(stylize("  [backup] "+backup, "gray"))
 					}
 				}
 				tStart := time.Now()
-				// Heartbeat while the tool runs: bash can legitimately take
-				// minutes (600s cap), and a silent terminal reads as a hang
-				// (audit A2). No-op on non-tty.
-				toolSpin := newThinkingIndicator()
-				toolSpin.setState("Running " + tc.Name)
-				toolSpin.start()
-				out, rerr := tool.Run(ctx, tc.Arguments)
-				toolSpin.stop()
+				var out string
+				var rerr error
+				if writeBackupErr != nil {
+					rerr = writeBackupErr
+				} else {
+					// Heartbeat while the tool runs: bash can legitimately take
+					// minutes (600s cap), and a silent terminal reads as a hang
+					// (audit A2). No-op on non-tty.
+					toolSpin := newThinkingIndicator()
+					toolSpin.setState("Running " + tc.Name)
+					toolSpin.start()
+					out, rerr = tool.Run(ctx, tc.Arguments)
+					toolSpin.stop()
+				}
 				if rerr != nil {
 					out = "[error] " + rerr.Error()
 				}
@@ -4406,6 +4770,9 @@ func repl(session *Session, apiKey string) {
 					fmt.Printf("session %q not found; type /list to see saved sessions.\n", target)
 					continue
 				}
+				// "always" approvals belong to the session in which they were
+				// granted, never to the REPL process as a whole.
+				resetAlwaysApproved()
 				session = loaded
 				provider = session.Provider
 				// The resumed session may belong to another provider; re-resolve

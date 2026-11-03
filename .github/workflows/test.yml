@@ -10,9 +10,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
       - run: go vet ./...
         working-directory: go
       - run: test -z "$(gofmt -l .)"
         working-directory: go
       - run: go test ./...
+        working-directory: go
+      - run: python3 -I -m unittest discover -s skill_tests -v
         working-directory: go

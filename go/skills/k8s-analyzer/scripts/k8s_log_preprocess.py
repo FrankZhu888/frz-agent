@@ -14,8 +14,14 @@ import zipfile
 import tarfile
 import tempfile
 import shutil
+import ntpath
 from datetime import datetime
 from collections import defaultdict
+
+# 限制错误样本和解压规模，避免内存及磁盘资源被异常输入耗尽
+MAX_SAMPLES_PER_COMPONENT = 100
+MAX_ARCHIVE_MEMBERS = 10000
+MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
 
 # K8s组件识别规则：组件名 → 匹配日志路径/特征关键字
 COMPONENT_RULES = [
@@ -191,8 +197,10 @@ LOG_LEVEL_PATTERNS = [
 
 class LogAnalyzer:
     def __init__(self):
-        self.errors = defaultdict(list)  # component → list of error entries
+        self.errors = defaultdict(list)  # component → bounded list of error samples
         self.warnings = defaultdict(list)
+        self.error_counts = defaultdict(int)
+        self.warning_counts = defaultdict(int)
         self.false_positives = 0
         self.total_lines = 0
         self.file_stats = defaultdict(int)  # file → line count
@@ -200,6 +208,8 @@ class LogAnalyzer:
         self.first_error_time = None
         self.first_error_component = None
         self.first_error_msg = None
+        self._first_error_key = None
+        self._first_error_entry = None
 
     def detect_component(self, filepath):
         """根据文件路径检测属于哪个K8s组件"""
@@ -235,12 +245,56 @@ class LogAnalyzer:
                 return m.group(1)
         return None
 
+    def parse_timestamp(self, value):
+        """将支持的时间格式转换为可比较时间；缺失日期使用固定默认值"""
+        if not value:
+            return None
+        microsecond = 0
+        try:
+            iso_match = re.match(
+                r"^(\d{4})-(\d{2})-(\d{2})[T ]"
+                r"(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$", value)
+            if iso_match:
+                year, month, day, hour, minute, second = map(int, iso_match.groups()[:6])
+                fraction = iso_match.group(7)
+                if fraction:
+                    microsecond = int((fraction + "000000")[:6])
+                return datetime(year, month, day, hour, minute, second, microsecond)
+
+            syslog_match = re.match(
+                r"^(\w{3})\s+(\d+)\s+(\d{2}):(\d{2}):(\d{2})$", value)
+            if syslog_match:
+                months = {
+                    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+                    "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+                    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+                }
+                month_name, day, hour, minute, second = syslog_match.groups()
+                return datetime(2000, months[month_name], int(day), int(hour), int(minute), int(second))
+
+            time_match = re.match(r"^(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$", value)
+            if time_match:
+                hour, minute, second = map(int, time_match.groups()[:3])
+                fraction = time_match.group(4)
+                if fraction:
+                    microsecond = int((fraction + "000000")[:6])
+                return datetime(2000, 1, 1, hour, minute, second, microsecond)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return None
+
     def extract_log_level(self, line):
         """提取日志级别"""
         for i, pat in enumerate(LOG_LEVEL_PATTERNS):
             if pat.search(line):
                 return ["FATAL", "PANIC", "ERROR", "WARNING"][i]
         return "INFO"
+
+    def _record_entry(self, samples, counts, component, entry):
+        """始终计数，但每个组件仅保留有限数量的样本"""
+        counts[component] += 1
+        if len(samples[component]) < MAX_SAMPLES_PER_COMPONENT:
+            samples[component].append(entry)
 
     def process_line(self, line, component, filepath, line_num):
         """处理单行日志"""
@@ -270,14 +324,24 @@ class LogAnalyzer:
             "matched_errors": errors,
         }
         if log_level in ["FATAL", "PANIC", "ERROR"]:
-            self.errors[component].append(entry)
-            # 记录第一个错误（根因）
-            if not self.first_error_time and log_time:
-                self.first_error_time = log_time
+            self._record_entry(self.errors, self.error_counts, component, entry)
+            # 无时间戳的错误也必须进入概览，不能误报为“集群正常”。
+            if self._first_error_entry is None:
+                self._first_error_entry = entry
                 self.first_error_component = component
                 self.first_error_msg = line[:200]
+            # 按时间选择首个错误；相同时间按文件路径和行号确定性排序
+            parsed_time = self.parse_timestamp(log_time)
+            if parsed_time is not None:
+                error_key = (parsed_time, filepath, line_num)
+                if self._first_error_key is None or error_key < self._first_error_key:
+                    self._first_error_key = error_key
+                    self._first_error_entry = entry
+                    self.first_error_time = log_time
+                    self.first_error_component = component
+                    self.first_error_msg = line[:200]
         elif log_level == "WARNING":
-            self.warnings[component].append(entry)
+            self._record_entry(self.warnings, self.warning_counts, component, entry)
 
     def process_file(self, filepath):
         """处理单个日志文件"""
@@ -298,7 +362,7 @@ class LogAnalyzer:
                     self.file_stats[filepath] = line_num
                     self.process_line(line, component, filepath, line_num)
         except Exception as e:
-            self.errors["unknown"].append({
+            self._record_entry(self.errors, self.error_counts, "unknown", {
                 "time": None,
                 "level": "ERROR",
                 "line_num": 0,
@@ -320,11 +384,42 @@ class LogAnalyzer:
                     self.process_file(fpath)
 
     def process_tar(self, tarpath):
-        """处理tar/tar.gz压缩包，解压到临时目录后处理"""
+        """安全处理tar/tar.gz压缩包，解压到临时目录后处理"""
         tmpdir = tempfile.mkdtemp(prefix="k8slog_")
         try:
             with tarfile.open(tarpath, "r:*") as tf:
-                tf.extractall(tmpdir)
+                members = []
+                total_size = 0
+                tmpdir_real = os.path.realpath(tmpdir)
+                for member in tf:
+                    if len(members) >= MAX_ARCHIVE_MEMBERS:
+                        raise ValueError(
+                            f"Archive contains too many members (limit {MAX_ARCHIVE_MEMBERS})")
+                    members.append(member)
+                    name = member.name
+                    normalized_name = name.replace("\\", "/")
+                    if (not name or os.path.isabs(name)
+                            or ntpath.isabs(name) or ntpath.splitdrive(name)[0]
+                            or ".." in normalized_name.split("/")):
+                        raise ValueError(f"Unsafe archive member path: {name}")
+                    if not (member.isfile() or member.isdir()):
+                        raise ValueError(f"Unsupported archive member type: {name}")
+                    destination = os.path.realpath(os.path.join(tmpdir_real, normalized_name))
+                    try:
+                        contained = os.path.commonpath([tmpdir_real, destination]) == tmpdir_real
+                    except ValueError:
+                        contained = False
+                    if not contained:
+                        raise ValueError(f"Archive member escapes extraction directory: {name}")
+                    if member.isfile():
+                        if member.size < 0:
+                            raise ValueError(f"Invalid archive member size: {name}")
+                        total_size += member.size
+                        if total_size > MAX_ARCHIVE_TOTAL_SIZE:
+                            raise ValueError(
+                                "Archive expanded size exceeds limit "
+                                f"({MAX_ARCHIVE_TOTAL_SIZE} bytes)")
+                tf.extractall(tmpdir, members=members)
             self.process_directory(tmpdir)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -342,8 +437,7 @@ class LogAnalyzer:
     def process_path(self, path):
         """处理任意路径：文件/目录/压缩包自动识别"""
         if not os.path.exists(path):
-            print(f"Error: Path {path} not found", file=sys.stderr)
-            return
+            raise FileNotFoundError(f"Path {path} not found")
         if os.path.isdir(path):
             self.process_directory(path)
         elif os.path.isfile(path):
@@ -362,32 +456,35 @@ class LogAnalyzer:
         report.append(f"**总日志行数**: {self.total_lines:,}")
         report.append(f"**识别到组件**: {', '.join([c for c in self.component_file_map if self.component_file_map[c]])}")
         report.append(f"**过滤非致命告警**: {self.false_positives} 条")
-        report.append(f"**发现ERROR级错误**: {sum(len(errs) for errs in self.errors.values())} 条")
-        report.append(f"**发现WARNING级告警**: {sum(len(warns) for warns in self.warnings.values())} 条\n")
+        report.append(f"**发现ERROR级错误**: {sum(self.error_counts.values())} 条")
+        report.append(f"**发现WARNING级告警**: {sum(self.warning_counts.values())} 条\n")
 
         # 根因概览
         report.append("### 1. 根因概览")
         if self.first_error_component:
-            report.append(f"- **首个致命错误时间**: {self.first_error_time}")
+            if self.first_error_time:
+                report.append(f"- **首个致命错误时间**: {self.first_error_time}")
+            else:
+                report.append("- **首个致命错误时间**: 日志未提供可比较的时间戳")
             report.append(f"- **异常组件**: {self.first_error_component}")
             report.append(f"- **错误信息**: {self.first_error_msg}\n")
             # 提取根因分类和建议
-            if self.errors[self.first_error_component]:
-                first_err = self.errors[self.first_error_component][0]
-                if first_err["matched_errors"]:
-                    _, desc, category, suggestion = first_err["matched_errors"][0]
-                    report.append(f"- **根因分类**: {category}")
-                    report.append(f"- **问题描述**: {desc}")
-                    report.append(f"- **初步修复建议**: {suggestion}\n")
+            if self._first_error_entry and self._first_error_entry["matched_errors"]:
+                _, desc, category, suggestion = self._first_error_entry["matched_errors"][0]
+                report.append(f"- **根因分类**: {category}")
+                report.append(f"- **问题描述**: {desc}")
+                report.append(f"- **初步修复建议**: {suggestion}\n")
         else:
             report.append("- ✅ 未发现明确ERROR级致命错误，集群状态基本正常\n")
 
         # 按组件展示错误
         report.append("### 2. 组件错误详情")
-        for component, errs in sorted(self.errors.items(), key=lambda x: -len(x[1])):
+        for component, errs in sorted(
+                self.errors.items(), key=lambda x: -self.error_counts[x[0]]):
             if not errs:
                 continue
-            report.append(f"#### 2.{len(report)-2} {component} 组件（{len(errs)}条错误）")
+            total_errors = self.error_counts[component]
+            report.append(f"#### 2.{len(report)-2} {component} 组件（{total_errors}条错误）")
             # 去重相同错误（相同pattern+line取前3条）
             seen_patterns = defaultdict(int)
             for err in errs[:10]:  # 最多展示前10条错误
@@ -407,11 +504,11 @@ class LogAnalyzer:
                     time_str = f"[{err['time']}] " if err["time"] else ""
                     report.append(f"- {time_str}**{err['level']}**: {err['line']}")
                     report.append(f"  - 位置: `{os.path.basename(err['filepath'])}` 第{err['line_num']}行")
-            if len(errs) > 10:
-                report.append(f"\n- （其余{len(errs)-10}条相似错误已省略）\n")
+            if total_errors > 10:
+                report.append(f"\n- （其余{total_errors-10}条相似错误已省略）\n")
 
         # 警告信息
-        total_warns = sum(len(w) for w in self.warnings.values())
+        total_warns = sum(self.warning_counts.values())
         if total_warns > 0:
             report.append("### 3. 警告信息（非致命，但需关注）")
             warn_count = 0
@@ -486,7 +583,11 @@ def main():
         output_path = f"k8s_diagnose_{base_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     analyzer = LogAnalyzer()
     print(f"正在分析日志: {input_path}", file=sys.stderr)
-    analyzer.process_path(input_path)
+    try:
+        analyzer.process_path(input_path)
+    except (OSError, ValueError, tarfile.TarError, zipfile.BadZipFile) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     report = analyzer.generate_report(output_path)
     print(report)
 

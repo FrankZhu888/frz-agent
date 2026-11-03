@@ -106,6 +106,29 @@ func TestClassifyCommand(t *testing.T) {
 		{"ifconfig eth0 10.0.0.99 netmask 255.255.255.0", riskReversible},
 		{"ping -f -s 65000 10.0.0.1", riskReversible},
 		{"tar -tf a.tar -I /tmp/evil.sh", riskReversible},
+		// Escaped quotes are literals, not phantom quoted regions that can hide
+		// a second command from splitChain.
+		{`echo \" ; find . -delete`, riskReversible},
+		{`echo \' ; find . -delete`, riskReversible},
+		{`echo "a\"b" ; touch /tmp/x`, riskReversible},
+		{`echo "hi ; there" | wc -c`, riskReadonly},
+		// bash decodes quoted options before exec; the classifier must do the same.
+		{`find . "-delete"`, riskReversible},
+		{`find . "-exec" printf marker \;`, riskReversible},
+		{`git diff "--output=/tmp/result"`, riskReversible},
+		{`tar -tf a.tar --checkpoint-action=exec=/bin/sh`, riskReversible},
+		{`find . -cpio /tmp/x`, riskReversible},
+		// iproute2 abbreviations are not safely handled by a write-word blacklist.
+		{`ip a f eth0`, riskReversible},
+		{`ip addr show`, riskReadonly},
+		{`ip route get 1.1.1.1`, riskReadonly},
+		// Reading credentials is not safe merely because it changes no files.
+		{`cat ~/.ssh/id_rsa`, riskReversible},
+		{`cat ~/.frza/config.json`, riskReversible},
+		{`cat /tmp/../etc/shadow`, riskReversible},
+		{`cat $HOME/.ssh/id_rsa`, riskReversible},
+		{`printenv ARK_API_KEY`, riskReversible},
+		{`grep '^ERROR$' /tmp/app.log`, riskReadonly}, // single-quoted $ is literal
 		// audit2 §1.4: only bare names and system-bin paths inherit whitelist
 		{"/tmp/attacker/bin/ls -la", riskReversible},
 		{"./ls --pwn", riskReversible},
@@ -132,6 +155,9 @@ func TestSplitChain(t *testing.T) {
 		{"a && b || c", []string{"a", "b", "c"}},
 		{"grep 'a;b' file | wc -l", []string{"grep 'a;b' file", "wc -l"}},
 		{`echo "x|y" && ls`, []string{`echo "x|y"`, "ls"}},
+		{`echo \" ; touch /tmp/x`, []string{`echo \"`, "touch /tmp/x"}},
+		{`echo "a\"b" ; touch /tmp/x`, []string{`echo "a\"b"`, "touch /tmp/x"}},
+		{`echo 'a\'b' ; ls`, []string{`echo 'a\'b' ; ls`}}, // backslash is literal inside single quotes
 		{"  df -h  ", []string{"df -h"}},
 	}
 	for _, c := range cases {
@@ -144,6 +170,19 @@ func TestSplitChain(t *testing.T) {
 			if got[i] != c.want[i] {
 				t.Errorf("splitChain(%q)[%d] = %q, want %q", c.cmd, i, got[i], c.want[i])
 			}
+		}
+	}
+}
+
+func TestSplitShellFieldsDecodesBashArguments(t *testing.T) {
+	got := splitShellFields(`find "a b" "-delete" \"\" 'literal\'`)
+	want := []string{"find", "a b", "-delete", `"`, `literal\`}
+	if len(got) != len(want) {
+		t.Fatalf("splitShellFields() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("field %d = %q, want %q", i, got[i], want[i])
 		}
 	}
 }
@@ -184,6 +223,17 @@ func TestRedactSecrets(t *testing.T) {
 		}
 		if strings.Contains(got, "Secret123") || strings.Contains(got, "abcd1234") || strings.Contains(got, "tok123") || strings.Contains(got, "xyz789") {
 			t.Errorf("secret leaked in redactSecrets(%q) = %q", c.in, got)
+		}
+	}
+}
+
+func TestRedactSecretsPrivateKeysAndNestedConfig(t *testing.T) {
+	privateKey := "-----BEGIN OPENSSH PRIVATE KEY-----\nsuper-secret-key-material\n-----END OPENSSH PRIVATE KEY-----"
+	config := "{\n  \"api_keys\": {\n    \"openai_responses\": \"sk-nested-secret\",\n    \"openai\": \"sk-other-secret\"\n  }\n}"
+	aws := "aws_access_key_id = AKIAIOSFODNN7EXAMPLE"
+	for _, secret := range []string{"super-secret-key-material", "sk-nested-secret", "sk-other-secret", "AKIAIOSFODNN7EXAMPLE"} {
+		if got := redactSecrets(privateKey + "\n" + config + "\n" + aws); strings.Contains(got, secret) {
+			t.Errorf("secret %q survived redaction: %s", secret, got)
 		}
 	}
 }

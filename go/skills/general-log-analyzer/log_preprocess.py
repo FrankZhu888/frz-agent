@@ -108,12 +108,17 @@ def extract_error_context(log_file_path: str) -> List[Tuple[int, List[str]]]:
                 if is_stack_trace_line(line):
                     pending_post_context += 1
 
-    # 去重重叠的错误片段
+    # 合并重叠或相邻的错误片段，保留每个错误及其完整上下文
     unique_errors = []
     last_end_line = 0
     for start_line, context in errors:
         end_line = start_line + len(context) - 1
-        if start_line > last_end_line:
+        if unique_errors and start_line <= last_end_line + 1:
+            # context 中与上一片段重叠的部分只保留一次，后续行全部追加
+            overlap = max(0, last_end_line - start_line + 1)
+            unique_errors[-1][1].extend(context[overlap:])
+            last_end_line = max(last_end_line, end_line)
+        else:
             unique_errors.append((start_line, context))
             last_end_line = end_line
 

@@ -176,7 +176,7 @@ func TestSplitChain(t *testing.T) {
 
 func TestSplitShellFieldsDecodesBashArguments(t *testing.T) {
 	got := splitShellFields(`find "a b" "-delete" \"\" 'literal\'`)
-	want := []string{"find", "a b", "-delete", `"`, `literal\`}
+	want := []string{"find", "a b", "-delete", `""`, `literal\`}
 	if len(got) != len(want) {
 		t.Fatalf("splitShellFields() = %#v, want %#v", got, want)
 	}

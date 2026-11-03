@@ -183,7 +183,7 @@ func TestMigrateSessionArtifactsKeepsUndoWorking(t *testing.T) {
 	if msg := undoLatest("new"); !strings.Contains(msg, "restored") {
 		t.Fatalf("undo after rename failed: %s", msg)
 	}
-	if data, _ := os.ReadFile(target); string(data) != "original") {
+	if data, _ := os.ReadFile(target); string(data) != "original" {
 		t.Errorf("wrong restored content: %q", data)
 	}
 }

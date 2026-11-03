@@ -1444,9 +1444,9 @@ var writeFlags = map[string][]string{
 	// audit2 §1.3: whitelisted commands with built-in write/exec forms
 	"git":    {"--output"}, // git diff/log/show --output=F overwrites F
 	"sysctl": {"-w", "--write"},
-	"ss":     {"-K", "--kill"},                                 // destroys sockets in the kernel
+	"ss":     {"-K", "--kill"},                                                        // destroys sockets in the kernel
 	"tar":    {"-I", "--use-compress-program", "--to-command", "--checkpoint-action"}, // programs can run even in list mode
-	"ping":   {"-f"},                                           // flood ping
+	"ping":   {"-f"},                                                                  // flood ping
 }
 
 // iproute2 accepts unique prefixes for objects and actions, so a blacklist is
@@ -1769,9 +1769,9 @@ func cutAtRuneBoundary(s string, n int) string {
 
 // redactSecrets masks common credential shapes before anything hits the journal.
 var (
-	secretDashP    = regexp.MustCompile(`(?i)(-p)(\S+)`)
-	secretSpacedP  = regexp.MustCompile(`(?i)(-p)\s+(\S+)`)
-	mysqlContextRe = regexp.MustCompile(`(?i)\bmysql(dump)?\b`)
+	secretDashP        = regexp.MustCompile(`(?i)(-p)(\S+)`)
+	secretSpacedP      = regexp.MustCompile(`(?i)(-p)\s+(\S+)`)
+	mysqlContextRe     = regexp.MustCompile(`(?i)\bmysql(dump)?\b`)
 	secretBearer       = regexp.MustCompile(`(?i)(bearer\s+)(\S+)`)
 	secretKeyword      = regexp.MustCompile(`(?i)((?:password|passwd|secret|token|api[_-]?key|authorization|aws_access_key_id)[\w-]*)(["'\s:=]+)(?:bearer\s+)?(\S+)`)
 	secretPrivateKey   = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
